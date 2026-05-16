@@ -50,7 +50,18 @@ run_in_env python -m pip install \
   --no-deps \
   "torch-scatter==${TORCH_SCATTER_VERSION}" \
   -f "https://data.pyg.org/whl/torch-${TORCH_VERSION}+${CUDA_TAG}.html"
-run_in_env python -m pip install -r requirements.txt
+
+REQ_NO_RASTER="$(mktemp)"
+grep -v '^submodules/diff-surfel-rasterization$' requirements.txt > "${REQ_NO_RASTER}"
+run_in_env python -m pip install -r "${REQ_NO_RASTER}"
+rm -f "${REQ_NO_RASTER}"
+
+if [[ -f "${REPO_ROOT}/submodules/diff-surfel-rasterization/setup.py" ]]; then
+  run_in_env python -m pip install \
+    --no-build-isolation \
+    --no-deps \
+    "${REPO_ROOT}/submodules/diff-surfel-rasterization"
+fi
 
 if [[ "${BUILD_DBAF}" == "1" && -f "${REPO_ROOT}/submodules/dbaf/setup.py" ]]; then
   (cd "${REPO_ROOT}/submodules/dbaf" && run_in_env python setup.py install)
