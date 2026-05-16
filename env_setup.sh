@@ -39,7 +39,7 @@ run_in_env() {
 cd "${REPO_ROOT}"
 git submodule update --init --recursive
 
-run_in_env python -m pip install --upgrade pip setuptools wheel
+run_in_env python -m pip install --upgrade pip wheel packaging "setuptools==69.5.1"
 run_in_env python -m pip install \
   "torch==${TORCH_VERSION}+${CUDA_TAG}" \
   "torchvision==${TORCHVISION_VERSION}+${CUDA_TAG}" \
