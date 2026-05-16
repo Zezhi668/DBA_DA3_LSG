@@ -5,10 +5,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_NAME="${ENV_NAME:-vings_isolated}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.9}"
 CONDA_BIN="${CONDA_BIN:-}"
-CUDA_TAG="${CUDA_TAG:-cu118}"
+CUDA_TAG="${CUDA_TAG:-cu117}"
 TORCH_VERSION="${TORCH_VERSION:-2.0.1}"
 TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.15.2}"
 TORCHAUDIO_VERSION="${TORCHAUDIO_VERSION:-2.0.2}"
+TORCH_SCATTER_VERSION="${TORCH_SCATTER_VERSION:-2.1.2}"
 BUILD_GTSAM="${BUILD_GTSAM:-1}"
 BUILD_DBAF="${BUILD_DBAF:-1}"
 INSTALL_DA3="${INSTALL_DA3:-0}"
@@ -40,13 +41,15 @@ git submodule update --init --recursive
 
 run_in_env python -m pip install --upgrade pip setuptools wheel
 run_in_env python -m pip install \
-  "torch==${TORCH_VERSION}" \
-  "torchvision==${TORCHVISION_VERSION}" \
-  "torchaudio==${TORCHAUDIO_VERSION}" \
+  "torch==${TORCH_VERSION}+${CUDA_TAG}" \
+  "torchvision==${TORCHVISION_VERSION}+${CUDA_TAG}" \
+  "torchaudio==${TORCHAUDIO_VERSION}+${CUDA_TAG}" \
   --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"
 run_in_env python -m pip install \
-  "torch-scatter==2.0.2" \
-  -f "https://data.pyg.org/whl/torch-2.0.2+${CUDA_TAG}.html"
+  --no-cache-dir \
+  --no-deps \
+  "torch-scatter==${TORCH_SCATTER_VERSION}" \
+  -f "https://data.pyg.org/whl/torch-${TORCH_VERSION}+${CUDA_TAG}.html"
 run_in_env python -m pip install -r requirements.txt
 
 if [[ "${BUILD_DBAF}" == "1" && -f "${REPO_ROOT}/submodules/dbaf/setup.py" ]]; then
