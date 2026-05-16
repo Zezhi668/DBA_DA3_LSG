@@ -11,6 +11,7 @@ import kornia
 # from onnx_runner import LightGlueRunner
 from loop.lightglue import LightGlueRunner
 from gaussian.loss_utils import ssim_loss
+from vings_utils.sim3_utils import ransac_umeyama
 
 
 class LoopDetector:
@@ -45,6 +46,23 @@ class LoopDetector:
         # vu.
         self.img_scales = np.array([ONNX_W/W, int(ONNX_W/W*H)/H])
 
+    def _min_depth(self):
+        return float(self.cfg.get('looper', {}).get('min_depth', 0.2))
+
+    def _max_depth(self):
+        return float(self.cfg.get('looper', {}).get('max_depth', 15.0))
+
+    def _accum_threshold(self):
+        return float(self.cfg.get('looper', {}).get('accum_threshold', 0.95))
+
+    def _pose_jump_threshold(self):
+        return float(
+            self.cfg.get('looper', {}).get(
+                'pose_jump_threshold',
+                self.cfg.get('submap', {}).get('pose_jump_threshold', 15.0),
+            )
+        )
+
     @staticmethod
     def _form_transf(R, t):
         T = np.eye(4, dtype=np.float64)
@@ -68,7 +86,10 @@ class LoopDetector:
         Attention, we should pass vu here, there is no uv.
         '''
         # Get kp1's world points.
-        valid_mask = torch.bitwise_and(gt_depth1.squeeze(0)[vu_kp1[:,1], vu_kp1[:,0]]>0.2, gt_depth1.squeeze(0)[vu_kp1[:,1], vu_kp1[:,0]]<15.0) # (N, )
+        min_depth = self._min_depth()
+        max_depth = self._max_depth()
+        valid_depth = gt_depth1.squeeze(0)[vu_kp1[:,1], vu_kp1[:,0]]
+        valid_mask = torch.bitwise_and(valid_depth > min_depth, valid_depth < max_depth) # (N, )
         if valid_mask.sum() < 10: return None 
         uv_depth = torch.stack([vu_kp1[valid_mask,1], vu_kp1[valid_mask,0], gt_depth1.squeeze(0)[vu_kp1[valid_mask,1], vu_kp1[valid_mask,0]]], dim=-1)
         world_points1 = tfer.transform(uv_depth, 'pixel', 'world', pose=c2w1).unsqueeze(0) # (1, N, 3)
@@ -93,6 +114,68 @@ class LoopDetector:
         else:
             pred_w2c2 = None
         return pred_w2c2
+
+    def get_sim3(self, depth_ref, depth_query, vu_ref, vu_query, tfer):
+        '''
+        Estimate query_from_ref as a 3D-3D Sim3 using matched depth on both sides.
+        All inputs are in the repo's (v, u) convention.
+        '''
+        depth_ref = depth_ref.squeeze()
+        depth_query = depth_query.squeeze()
+        if depth_ref.ndim != 2 or depth_query.ndim != 2:
+            return None
+
+        z_ref = depth_ref[vu_ref[:, 1], vu_ref[:, 0]]
+        z_query = depth_query[vu_query[:, 1], vu_query[:, 0]]
+        min_depth = self._min_depth()
+        max_depth = self._max_depth()
+        valid_mask = (
+            torch.isfinite(z_ref)
+            & torch.isfinite(z_query)
+            & (z_ref > min_depth)
+            & (z_query > min_depth)
+            & (z_ref < max_depth)
+            & (z_query < max_depth)
+        )
+
+        min_matches = int(
+            self.cfg.get('submap', {}).get(
+                'validation_min_matches',
+                self.cfg['looper']['is_loop_min_match_num'],
+            )
+        )
+        if valid_mask.sum().item() < min_matches:
+            return None
+
+        ref_uvd = torch.stack(
+            [vu_ref[valid_mask, 1].float(), vu_ref[valid_mask, 0].float(), z_ref[valid_mask].float()],
+            dim=-1,
+        )
+        query_uvd = torch.stack(
+            [vu_query[valid_mask, 1].float(), vu_query[valid_mask, 0].float(), z_query[valid_mask].float()],
+            dim=-1,
+        )
+
+        ref_pts_cam = tfer.transform(ref_uvd, 'pixel', 'cam').detach().cpu().numpy()
+        query_pts_cam = tfer.transform(query_uvd, 'pixel', 'cam').detach().cpu().numpy()
+        sim3_query_from_ref, inliers = ransac_umeyama(
+            ref_pts_cam,
+            query_pts_cam,
+            iters=int(self.cfg.get('sim3_ransac_iters', 256)),
+            sample_size=int(self.cfg.get('sim3_ransac_sample_size', 4)),
+            min_inliers=int(self.cfg.get('sim3_min_inliers', min_matches)),
+            inlier_threshold=float(self.cfg.get('sim3_inlier_threshold', 0.25)),
+        )
+        if sim3_query_from_ref is None or inliers is None:
+            return None
+
+        return {
+            'R': sim3_query_from_ref.R,
+            't': sim3_query_from_ref.t,
+            's': float(sim3_query_from_ref.s),
+            'inlier_mask': inliers,
+            'match_count': int(inliers.sum()),
+        }
 
     @staticmethod
     def dilation(input_image, kernel_size=50):
@@ -136,10 +219,7 @@ class LoopDetector:
             with torch.no_grad():
                 gt_depth2 = gaussian_model.render(torch.linalg.inv(c2w2), intrinsic_dict)['depth']
                 # gt_depth2[gt_depth2>torch.median(gt_depth2)*10] = 0.0
-                if not self.cfg['use_metric']:
-                    gt_depth2[gt_depth2>15] = 0.0
-                else:
-                    gt_depth2[gt_depth2>15] = 0.0
+                gt_depth2[gt_depth2 > self._max_depth()] = 0.0
                 
         if (gt_depth2.squeeze(0)[vu_kp2[:,1], vu_kp2[:,0]] > 0.0).sum() < 10:
             return None, 1.0 # torch.tensor(1.0, device=c2w2.device)
@@ -153,7 +233,7 @@ class LoopDetector:
         
         # TTD 2024/12/12
         # Dangerous Option.
-        if torch.linalg.norm(torch.linalg.inv(w2c1)[:3, 3] - c2w2[:3, 3]) > 15.0:
+        if torch.linalg.norm(torch.linalg.inv(w2c1)[:3, 3] - c2w2[:3, 3]) > self._pose_jump_threshold():
             return None, 1.0
         
         with torch.no_grad():
@@ -166,7 +246,10 @@ class LoopDetector:
         # kp_mask    = self.get_kp_mask(vu_kp2, pred_img2)
         # Calculate relative L1Loss to judge wether detect a loop, or we can use neightbour frames to set the threshold.
         # mask_error = (pred_img2[:, kp_mask] - gt_img2[:, kp_mask]).abs().mean() # (3, H, W)
-        valid_mask = torch.bitwise_and(pred_accum1 > 0.95, pred_depth1.squeeze(0) < 15.0)
+        valid_mask = torch.bitwise_and(
+            pred_accum1 > self._accum_threshold(),
+            pred_depth1.squeeze(0) < self._max_depth(),
+        )
         # valid_mask = gt_img1.sum(axis=0) > 0.0
         
         
@@ -212,10 +295,7 @@ class LoopDetector:
             with torch.no_grad():
                 gt_depth2 = gaussian_model.render(torch.linalg.inv(c2w2), intrinsic_dict)['depth']
                 # gt_depth2[gt_depth2>torch.median(gt_depth2)*10] = 0.0
-                if not self.cfg['use_metric']:
-                    gt_depth2[gt_depth2>10] = 0.0
-                else:
-                    gt_depth2[gt_depth2>10] = 0.0
+                gt_depth2[gt_depth2 > self._max_depth()] = 0.0
                 
         if (gt_depth2.squeeze(0)[vu_kp2[:,1], vu_kp2[:,0]] > 0.0).sum() < 12:
             return None, 1.0, 1.0, None, 1e3 # torch.tensor(1.0, device=c2w2.device)
@@ -243,8 +323,11 @@ class LoopDetector:
         # kp_mask    = self.get_kp_mask(vu_kp2, pred_img2)
         # Calculate relative L1Loss to judge wether detect a loop, or we can use neightbour frames to set the threshold.
         # mask_error = (pred_img2[:, kp_mask] - gt_img2[:, kp_mask]).abs().mean() # (3, H, W)
-        valid_mask = torch.bitwise_and(pred_accum1 > 0.9, pred_depth1.squeeze(0) < 25.0)
-        if valid_mask.sum() < 344*616/4: 
+        valid_mask = torch.bitwise_and(
+            pred_accum1 > self._accum_threshold(),
+            pred_depth1.squeeze(0) < self._max_depth(),
+        )
+        if valid_mask.sum() < 0.25 * valid_mask.numel(): 
             return None, 1.0, 1.0, None, 1e3
         # valid_mask = gt_img1.sum(axis=0) > 0.0
         

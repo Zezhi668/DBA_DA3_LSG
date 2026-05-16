@@ -1,6 +1,18 @@
 import numpy as np
 import torch
 import os
+import sys
+
+
+SCRIPT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+
+REPO_ROOT = os.path.dirname(SCRIPT_ROOT)
+GTSAM_PYTHON_ROOT = os.path.join(REPO_ROOT, "submodules", "gtsam", "build", "python")
+if os.path.isdir(GTSAM_PYTHON_ROOT) and GTSAM_PYTHON_ROOT not in sys.path:
+    sys.path.insert(0, GTSAM_PYTHON_ROOT)
+
 from frontend.dbaf import DBAFusion
 import argparse
 parser = argparse.ArgumentParser(description="Add config path.")
@@ -16,20 +28,27 @@ import shutil
 import importlib
 get_dataset = importlib.import_module(config["dataset"]["module"]).get_dataset
 from vings_utils.middleware_utils import judge_and_package
+from vings_utils.memory_monitor import MemoryMonitor
 
 import open3d as o3d
 from lietorch import SE3
 from gaussian.vis_utils import check_pcd_with_poses
 from metric.metric_model import Metric_Model
+if config['mode'] == 'vo_mast3rslam': from frontend_mast3r.mast3r_slam import Mast3rSLAM
 
 class Runner:
     def __init__(self, cfg):
         self.cfg = cfg
+        self.memory_monitor = MemoryMonitor(cfg, label="run_tracking")
         self.dataset  = get_dataset(cfg)
         cfg['frontend']['c2i'] = self.dataset.c2i # (4, 4), ndarray
-        self.tracker = DBAFusion(cfg)
-        if 'use_metric' in cfg.keys() and cfg['use_metric']:
+        if self.cfg['mode'] == 'vo_mast3rslam':
+            self.tracker = Mast3rSLAM(cfg)
+        else:
+            self.tracker = DBAFusion(cfg)
+        if 'use_metric' in cfg.keys() and cfg['use_metric'] and self.cfg['mode'] != 'vo_mast3rslam':
             self.metric_predictor = Metric_Model(cfg)
+        self.memory_monitor.record(-1, tag="post_init", force=True)
             
             
     def run(self):
@@ -37,62 +56,69 @@ class Runner:
         self.tracker.frontend.all_imu   = self.dataset.preload_imu()
         self.tracker.frontend.all_stamp = self.dataset.preload_camtimestamp()
         print(self.tracker.frontend.all_imu[:5,:])
-        # Run Tracking.
-        for idx in range(0, min(len(self.dataset), 30000)):
-            data_packet = self.dataset[idx]
-            
-            if 'use_metric' in self.cfg.keys() and self.cfg['use_metric']:
-                # data_packet['depth'] = self.metric_predictor.predict(data_packet['rgb'][0])
-                # print('depth.shape: ', data_packet['depth'].shape)
-                pass
-            
-            self.tracker.track(data_packet)
-            
-            # Save poses.
-            if (idx+1) % 500 == 0 or idx == len(self.dataset)-1:
-                tstamp_save = self.tracker.frontend.video.tstamp_save[:self.tracker.frontend.video.count_save].cpu().tolist()
-                poses_save  = self.tracker.frontend.video.poses_save[:self.tracker.frontend.video.count_save].cpu()
+        try:
+            # Run Tracking.
+            for idx in range(0, min(len(self.dataset), 30000)):
+                data_packet = self.dataset[idx]
                 
-                for iiiddxx in range(len(tstamp_save)):
-                    timestamp = tstamp_save[iiiddxx]
-                    c2w = SE3(poses_save[iiiddxx]).inv().matrix().cpu().numpy()
-                    np.savetxt(f"{self.cfg['output']['save_dir']}/droid_c2w/{timestamp}.txt", c2w)
-            
-            
-            # TTD 2024/12/06
-            if 'debug_mode' in list(self.cfg.keys()) and self.cfg['debug_mode']:
-                viz_out = judge_and_package(self.tracker, data_packet['intrinsic'])
-                if viz_out is not None:
-                    start_timestamp = viz_out['viz_out_idx_to_f_idx'][0].item()
-                    end_timestamp   = viz_out['viz_out_idx_to_f_idx'][-1].item()
-                    # save_name = os.path.join(config['output']['save_dir'], 'vizout_dict', '{}to{}.pth'.format(round(start_timestamp, 4), round(end_timestamp, 4))) 
-                    save_name = os.path.join(config['output']['save_dir'], 'vizout_dict', '{}to{}.pth'.format(str(float(start_timestamp)).zfill(12), str(float(end_timestamp)).zfill(12))) 
+                if 'use_metric' in self.cfg.keys() and self.cfg['use_metric'] and self.cfg['mode'] != 'vo_mast3rslam':
+                    # data_packet['depth'] = self.metric_predictor.predict(data_packet['rgb'][0])
+                    # print('depth.shape: ', data_packet['depth'].shape)
+                    pass
+                
+                self.tracker.track(data_packet)
+                
+                # Save poses.
+                if (idx+1) % 500 == 0 or idx == len(self.dataset)-1:
+                    tstamp_save = self.tracker.frontend.video.tstamp_save[:self.tracker.frontend.video.count_save].cpu().tolist()
+                    poses_save  = self.tracker.frontend.video.poses_save[:self.tracker.frontend.video.count_save].cpu()
                     
-                    torch.save(viz_out, save_name)
-            
-            # torch.cuda.empty_cache()
-            # Judge whether new keyframe is added and package keyframe dict.
-            # viz_out = judge_and_package(self.tracker, data_packet['intrinsic'])
-            
-            # if viz_out is not None and idx % 10 == 0:
-            #    self.save_c2ws(idx, viz_out)
-            # if viz_out is not None and self.tracker.video.imu_enabled:
-            #    save_dir = '/data/wuke/DATA/2024/DroidOutput/KITTI/2011_10_03_drive0027_sync/process_dict/'
-            #    torch.save(viz_out, f"{save_dir}/{str(idx).zfill(6)}.pth")
+                    for iiiddxx in range(len(tstamp_save)):
+                        timestamp = tstamp_save[iiiddxx]
+                        c2w = SE3(poses_save[iiiddxx]).inv().matrix().cpu().numpy()
+                        np.savetxt(f"{self.cfg['output']['save_dir']}/droid_c2w/{timestamp}.txt", c2w)
+                
+                
+                # TTD 2024/12/06
+                if 'debug_mode' in list(self.cfg.keys()) and self.cfg['debug_mode']:
+                    viz_out = judge_and_package(self.tracker, data_packet['intrinsic'])
+                    if viz_out is not None:
+                        start_timestamp = viz_out['viz_out_idx_to_f_idx'][0].item()
+                        end_timestamp   = viz_out['viz_out_idx_to_f_idx'][-1].item()
+                        # save_name = os.path.join(config['output']['save_dir'], 'vizout_dict', '{}to{}.pth'.format(round(start_timestamp, 4), round(end_timestamp, 4))) 
+                        save_name = os.path.join(config['output']['save_dir'], 'vizout_dict', '{}to{}.pth'.format(str(float(start_timestamp)).zfill(12), str(float(end_timestamp)).zfill(12))) 
+                        
+                        torch.save(viz_out, save_name)
 
-        # Save Poses' ply.
-        SAVE_POSES = True
-        if SAVE_POSES:
-            c2ws      = SE3(self.tracker.video.poses_save[:self.tracker.video.count_save]).inv().matrix().detach().cpu()
-            poses_ply = check_pcd_with_poses(None, c2ws)
-            o3d.io.write_point_cloud(f"{self.cfg['output']['save_dir']}/ply/all_c2ws.ply", poses_ply)
+                self.memory_monitor.record(idx, tag="tracking_step")
+                
+                # torch.cuda.empty_cache()
+                # Judge whether new keyframe is added and package keyframe dict.
+                # viz_out = judge_and_package(self.tracker, data_packet['intrinsic'])
+                
+                # if viz_out is not None and idx % 10 == 0:
+                #    self.save_c2ws(idx, viz_out)
+                # if viz_out is not None and self.tracker.video.imu_enabled:
+                #    save_dir = '/data/wuke/DATA/2024/DroidOutput/KITTI/2011_10_03_drive0027_sync/process_dict/'
+                #    torch.save(viz_out, f"{save_dir}/{str(idx).zfill(6)}.pth")
+
+            # Save Poses' ply.
+            SAVE_POSES = True
+            if SAVE_POSES:
+                c2ws      = SE3(self.tracker.video.poses_save[:self.tracker.video.count_save]).inv().matrix().detach().cpu()
+                poses_ply = check_pcd_with_poses(None, c2ws)
+                o3d.io.write_point_cloud(f"{self.cfg['output']['save_dir']}/ply/all_c2ws.ply", poses_ply)
+        finally:
+            self.memory_monitor.close()
         
         
     def save_c2ws(self, global_idx, viz_out):
-        torch.save(viz_out['viz_out_idx_to_f_idx'], f"/data/wuke/workspace/VINGS-Mono/debug/timestamps_{global_idx}.pth")
-        torch.save(viz_out['poses'], f"/data/wuke/workspace/VINGS-Mono/debug/c2ws_{global_idx}.pth")
-        torch.save(viz_out['depths_cov'], f"/data/wuke/workspace/VINGS-Mono/debug/depths_cov_up_{global_idx}.pth")
-        torch.save(viz_out['depths'], f"/data/wuke/workspace/VINGS-Mono/debug/depths_{global_idx}.pth")
+        debug_dir = os.path.join(self.cfg['output']['save_dir'], 'debug')
+        os.makedirs(debug_dir, exist_ok=True)
+        torch.save(viz_out['viz_out_idx_to_f_idx'], os.path.join(debug_dir, f'timestamps_{global_idx}.pth'))
+        torch.save(viz_out['poses'], os.path.join(debug_dir, f'c2ws_{global_idx}.pth'))
+        torch.save(viz_out['depths_cov'], os.path.join(debug_dir, f'depths_cov_up_{global_idx}.pth'))
+        torch.save(viz_out['depths'], os.path.join(debug_dir, f'depths_{global_idx}.pth'))
 
         
 if __name__ == '__main__':

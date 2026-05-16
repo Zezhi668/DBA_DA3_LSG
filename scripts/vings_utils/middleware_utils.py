@@ -8,6 +8,39 @@ from frontend_vo.vio_slam import VioSLAM
 def tq_to_matrix(tqs: torch.Tensor):
     return SE3(tqs.cpu()).matrix()
 
+
+def _filter_frames_with_valid_depth(
+    tstamps,
+    rgbs,
+    depths,
+    depths_cov,
+    c2ws,
+    global_kf_ids=None,
+    valid_localkf_id=None,
+):
+    frame_valid_mask = (depths > 0).reshape(depths.shape[0], -1).any(dim=1)
+    if not torch.any(frame_valid_mask):
+        return None
+
+    def _select_with_mask(tensor):
+        if not torch.is_tensor(tensor):
+            return tensor
+        tensor_mask = frame_valid_mask.to(device=tensor.device)
+        return tensor[tensor_mask]
+
+    filtered = {
+        'tstamps': _select_with_mask(tstamps),
+        'rgbs': _select_with_mask(rgbs),
+        'depths': _select_with_mask(depths),
+        'depths_cov': _select_with_mask(depths_cov),
+        'c2ws': _select_with_mask(c2ws),
+    }
+    if global_kf_ids is not None:
+        filtered['global_kf_id'] = _select_with_mask(global_kf_ids)
+    if valid_localkf_id is not None:
+        filtered['valid_localkf_id'] = _select_with_mask(valid_localkf_id)
+    return filtered
+
 # -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  - 
 def judge_and_package_v0(dba_fusion, intrinsics):
     '''
@@ -229,11 +262,30 @@ def judge_and_package_v3(dba_fusion, intrinsics):
             zero_mask = torch.bitwise_or(depths > dba_fusion.cfg['middleware']['max_depth'], depths_cov>dba_fusion.cfg['middleware']['cov_times']*(cov_median))
             # zero_mask = depths > dba_fusion.cfg['middleware']['max_depth']
             depths[zero_mask] = 0.0
-            depths_cov[depths==0] = depths_cov[depths>0].max()
             
             # depths_cov[zero_mask] = 0.0
             w2c_tqs    = dba_fusion.video.poses[valid_localkf_id]
             c2ws       = torch.linalg.inv(tq_to_matrix(w2c_tqs))
+            filtered = _filter_frames_with_valid_depth(
+                tstamps=tstamps,
+                rgbs=rgbs,
+                depths=depths,
+                depths_cov=depths_cov,
+                c2ws=c2ws,
+                global_kf_ids=localkf_id_to_globalkf_id,
+                valid_localkf_id=valid_localkf_id,
+            )
+            if filtered is None:
+                return None
+
+            tstamps = filtered['tstamps']
+            rgbs = filtered['rgbs']
+            depths = filtered['depths']
+            depths_cov = filtered['depths_cov']
+            c2ws = filtered['c2ws']
+            localkf_id_to_globalkf_id = filtered['global_kf_id']
+            valid_localkf_id = filtered['valid_localkf_id']
+            depths_cov[depths == 0] = 0.0
             intrinsic  = {'fu': intrinsics[1], 'fv':intrinsics[0], 'cu':intrinsics[3], 'cv':intrinsics[2], 'H':depths.shape[1], 'W':depths.shape[2]}
             rgbs[(depths.squeeze(-1)==0)] = 0.0
             pixel_mask = torch.ones_like(depths.squeeze(-1), dtype=torch.bool)
@@ -301,9 +353,17 @@ def judge_and_package_nerfslam(vio_slam: VioSLAM, intrinsics):
     return viz_out
 
 
+def judge_and_package_mast3rslam(mast3r_slam, intrinsics):
+    if mast3r_slam.viz_out is None:
+        return None
+    return mast3r_slam.viz_out
+
+
 def judge_and_package(dba_fusion, intrinsics):
     # Serve for KITTI.
-    if not dba_fusion.cfg['mode'] == 'vo_nerfslam':
+    if dba_fusion.cfg['mode'] == 'vo_mast3rslam':
+        viz_out = judge_and_package_mast3rslam(dba_fusion, intrinsics)
+    elif not dba_fusion.cfg['mode'] == 'vo_nerfslam':
         if 'kitti360_unsync' not in dba_fusion.cfg['dataset']['module']:
             viz_out = judge_and_package_v3(dba_fusion, intrinsics)
         else:

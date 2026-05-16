@@ -850,7 +850,8 @@ class DBAFusionFrontend:
         self.t0 = 0
         self.t1 = self.video.counter.value
 
-        self.graph.add_neighborhood_factors(self.t0, self.t1, r=3)
+        init_radius = int(self.cfg.get('frontend', {}).get('init_neighborhood_radius', 3))
+        self.graph.add_neighborhood_factors(self.t0, self.t1, r=init_radius)
 
         self.init_IMU()
 

@@ -1,0 +1,8 @@
+# Ignore build directory
+build/
+
+# Ignore dist directory
+dist/
+
+# Ignore .rgg-info file or directory
+.rgg-info

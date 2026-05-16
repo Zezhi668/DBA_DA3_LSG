@@ -24,6 +24,7 @@ from gaussian.normal_utils import depth_propagate_normal
 # TTD 2024/11/17
 from vings_utils.refineposes_utils import get_xyz_bias_multi, get_new_xyz_single
 from gaussian.loss_utils import l1_loss, ssim_loss
+from vings_utils.altitude_regularization import ConstantAltitudeLoss
 
 
 class GaussianModel(GaussianBase):
@@ -32,6 +33,18 @@ class GaussianModel(GaussianBase):
         self.wandber = Wandber(cfg, self.cfg['output']['save_dir'].split('/')[-1])
         self.global_c2w = {}
         self.time_idx   = 0
+        self.altitude_loss = ConstantAltitudeLoss.from_cfg(cfg)
+
+    def _altitude_anchor_from_batch(self, batch, poses):
+        if "altitude_anchor_z" in batch:
+            return batch["altitude_anchor_z"]
+        return self.altitude_loss.anchor_from_poses(poses)
+
+    def _pose_altitude_loss(self, batch, rectified_poses):
+        if not self.altitude_loss.active:
+            return rectified_poses.new_zeros(())
+        anchor_z = self._altitude_anchor_from_batch(batch, rectified_poses)
+        return self.altitude_loss(rectified_poses, anchor_z=anchor_z)
 
     def init_first_frame(self, batch):
         '''
@@ -53,14 +66,28 @@ class GaussianModel(GaussianBase):
         pc_world_list = []
         pc_color_list = []
         pc_rots_list = []
+        pc_globalkf_id_list = []
+        batch_global_kf_id = batch.get("global_kf_id")
         for idx in range(depths.shape[0]):
             pose = poses[idx] # (4, 4)
             depth = depths[idx] # (H, W)
             rgb = images[idx] # (H, W, 3)
             xyz, rgb, q = get_pointcloud(self.tfer, pose, rgb.permute(2, 0, 1), depth.permute(2, 0, 1), None, 50000) 
+            if xyz.shape[0] == 0:
+                continue
             pc_world_list.append(xyz)
             pc_color_list.append(rgb)
             pc_rots_list.append(q)
+            if batch_global_kf_id is not None:
+                global_kf_id = int(batch_global_kf_id[idx].item())
+            else:
+                global_kf_id = 0
+            pc_globalkf_id_list.append(
+                torch.full((xyz.shape[0],), global_kf_id, dtype=torch.long, device=self.device)
+            )
+
+        if not pc_world_list:
+            raise ValueError("Cannot initialize Gaussian map: no valid depth pixels in initialization batch.")
 
         # (3) Set self.history_list.
         self.history_list = batch['viz_out_idx_to_f_idx'].tolist()
@@ -68,6 +95,7 @@ class GaussianModel(GaussianBase):
         pc_world = torch.cat(pc_world_list, dim=0)# (N, 3)
         pc_world_color = torch.cat(pc_color_list, dim=0) # (N, 3)
         pc_world_rots  = torch.cat(pc_rots_list, dim=0) # (N, 4)
+        pc_globalkf_id = torch.cat(pc_globalkf_id_list, dim=0) # (N,)
                 
         dist2 = torch.clamp_min(distCUDA2(pc_world), 0.0000001)
         scales = torch.log(1.0 * torch.sqrt(dist2))[..., None].repeat(1, 2) # (N, 2)
@@ -82,8 +110,9 @@ class GaussianModel(GaussianBase):
         self._global_scores = torch.zeros((pc_world.shape[0], 2), dtype=torch.float32, device=self.device)
         self._stable_mask   = torch.zeros(pc_world.shape[0], dtype=torch.bool, device=self.device)
         # TTD 2024/10/01, 记录每个gaussian到底属于哪个global_kf_id, 这个逃不掉的, 反正之后做loop closure肯定也要用。
-        self._globalkf_id         = torch.zeros((pc_world.shape[0], ), dtype=torch.long, device=self.device)
+        self._globalkf_id         = pc_globalkf_id.clone()
         self._globalkf_max_scores = torch.zeros((pc_world.shape[0], ), dtype=torch.float32, device=self.device)
+        self._birth_globalkf_id   = pc_globalkf_id.clone()
 
         if self.cfg['use_sky']:
             self.sky_model = SkyModel(self)
@@ -94,6 +123,7 @@ class GaussianModel(GaussianBase):
         new_added_depth = new_added_frame['depth'] # (H, W, 1)
         new_added_color = new_added_frame['image'] # (H, W, 3)
         intrinsic_dict  = new_added_frame['intrinsic']
+        control_cfg = self.cfg.get("gaussian_control", {}) or {}
         new_added_c2w = new_added_pose # (4, 4)
         new_added_w2c = torch.inverse(new_added_c2w)
         with torch.no_grad():
@@ -103,20 +133,33 @@ class GaussianModel(GaussianBase):
             pred_depth = rets['depth'] # (1, H, W)
             radii      = rets['radii'] # (1, H, W)
 
-            # Delete pixels with large rgb error and in 1.5*gt_depth range.
-            res_rgb = torch.abs(pred_rgb - new_added_color.permute(2, 0, 1)).sum(axis=0) # (H, W)
-            loss_threshold   = 0.15
-            delete_pixelmask = torch.bitwise_and((pred_depth.squeeze(0) < 1.5 * new_added_depth.squeeze(-1)), (res_rgb > loss_threshold)) # 
-            
             proj_uv = self.tfer.transform(self.get_property('_xyz'), 'world', 'pixel', pose=new_added_c2w) # (P, 3), P = validdepth_mask.sum()
             visible_gaussianmask = (proj_uv[:, 0] > 0) & (proj_uv[:, 0] < self.tfer.H-1) & (proj_uv[:, 1] > 0) & (proj_uv[:, 1] < self.tfer.W-1) & (proj_uv[:, 2] > 0.01) # (P)
             
-            delete_gaussianmask  = torch.zeros_like(visible_gaussianmask)
-            delete_gaussianmask[visible_gaussianmask][delete_pixelmask[proj_uv[visible_gaussianmask,0].to(torch.long), proj_uv[visible_gaussianmask,1].to(torch.long)]] = True
+            delete_gaussianmask = torch.zeros_like(visible_gaussianmask)
+            if control_cfg.get("photometric_prune", True):
+                # Delete pixels with large rgb error and in configurable gt-depth range.
+                res_rgb = torch.abs(pred_rgb - new_added_color.permute(2, 0, 1)).sum(axis=0) # (H, W)
+                loss_threshold = float(control_cfg.get("photometric_prune_rgb_threshold", 0.15))
+                depth_factor = float(control_cfg.get("photometric_prune_depth_factor", 1.5))
+                delete_pixelmask = torch.bitwise_and(
+                    (pred_depth.squeeze(0) < depth_factor * new_added_depth.squeeze(-1)),
+                    (res_rgb > loss_threshold),
+                )
+                visible_indices = torch.nonzero(visible_gaussianmask, as_tuple=False).reshape(-1)
+                if visible_indices.numel() > 0:
+                    visible_uv = proj_uv[visible_indices]
+                    delete_visible = delete_pixelmask[
+                        visible_uv[:, 0].to(torch.long),
+                        visible_uv[:, 1].to(torch.long),
+                    ]
+                    delete_gaussianmask[visible_indices[delete_visible]] = True
             # delete_gaussianmask[visible_gaussianmask][proj_uv[visible_gaussianmask,2] > 1.5 * new_added_depth.squeeze(-1)[proj_uv[visible_gaussianmask,0].to(torch.int32), proj_uv[visible_gaussianmask,1].to(torch.int32)]] = False
 
             # Prune Gaussians have big radii.
-            delete_gaussianmask[radii>25] = True
+            radii_prune_threshold = float(control_cfg.get("radii_prune_threshold", 25.0))
+            if radii_prune_threshold > 0:
+                delete_gaussianmask[radii > radii_prune_threshold] = True
             
         new_dict = self.prune_tensors_from_optimizer(self.optimizer, delete_gaussianmask)
         self.update_properties(new_dict)
@@ -127,14 +170,23 @@ class GaussianModel(GaussianBase):
             # Add Gaussians on area with "large rgb/depth error or have low accum".
             pred_accum  = rets['accum'] # (1, H, W)
             pred_depth  = rets['depth'] # (1, H, W)
+            pred_rgb    = rets['rgb']   # (3, H, W)
             depth_error = torch.abs(pred_depth-new_added_depth.permute(2, 0, 1))
             rgb_error   = torch.abs(pred_rgb-new_added_color.permute(2, 0, 1)).sum(axis=0, keepdim=True)
-            pred_accum[depth_error > 10*depth_error.median()] = 0.0
-            pred_accum[rgb_error > 0.1] = 0.0
+            depth_gate = float(control_cfg.get("densify_depth_error_median_factor", 10.0))
+            rgb_gate = float(control_cfg.get("densify_rgb_error_threshold", 0.1))
+            if depth_gate > 0:
+                pred_accum[depth_error > depth_gate*depth_error.median()] = 0.0
+            if rgb_gate > 0:
+                pred_accum[rgb_error > rgb_gate] = 0.0
 
         # Get point cloud and concat it to GaussianModel.
-        new_added_pc, new_added_pc_color, unnorm_rots = get_pointcloud(self.tfer, new_added_c2w, new_added_color.permute(2, 0, 1), new_added_depth.permute(2, 0, 1), pred_accum, 40000) # 30000
+        densify_points_per_frame = int(control_cfg.get("densify_points_per_frame", 40000))
+        new_added_pc, new_added_pc_color, unnorm_rots = get_pointcloud(self.tfer, new_added_c2w, new_added_color.permute(2, 0, 1), new_added_depth.permute(2, 0, 1), pred_accum, densify_points_per_frame) # 30000
         num_pts = new_added_pc.shape[0]
+        if num_pts == 0:
+            print("Skipping Gaussian densification: new frame has no uncovered valid depth.", flush=True)
+            return
 
         dist2 = torch.clamp_min(distCUDA2(new_added_pc), 0.0000001)
         log_scales = torch.log(1.0 * torch.sqrt(dist2))[..., None].repeat(1, 2)
@@ -153,7 +205,23 @@ class GaussianModel(GaussianBase):
         self._scaling = torch.nn.Parameter(torch.cat((self._scaling, new_params['_scaling']), dim=0).requires_grad_(True))
         self._rotation = torch.nn.Parameter(torch.cat((self._rotation, new_params['_rotation']), dim=0).requires_grad_(True))
         self._opacity = torch.nn.Parameter(torch.cat((self._opacity, new_params['_opacity']), dim=0).requires_grad_(True))
-        self.update_records(mode="densify", densify_gaussiannum=num_pts)
+        new_global_kf_id = new_added_frame.get('global_kf_id', 0)
+        if torch.is_tensor(new_global_kf_id):
+            new_global_kf_id = int(new_global_kf_id.item())
+        else:
+            new_global_kf_id = int(new_global_kf_id)
+        densify_globalkf_id = torch.full(
+            (num_pts,),
+            new_global_kf_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.update_records(
+            mode="densify",
+            densify_gaussiannum=num_pts,
+            densify_globalkf_id=densify_globalkf_id,
+            densify_birth_globalkf_id=densify_globalkf_id,
+        )
         
         if self.cfg['use_sky']:
             self.sky_model.add_new_frame(new_added_frame)
@@ -166,23 +234,147 @@ class GaussianModel(GaussianBase):
         largeerror_mask = _current_scores[:, 1] > self._local_scores[:, 1]
         self._local_scores[largeerror_mask, 1]  = _current_scores[largeerror_mask, 1]
         self._global_scores  = torch.clamp(self._global_scores, 0, 1e4)
+
+    def _ensure_birth_record_length(self, target_len, context):
+        target_len = int(target_len)
+        old_len = int(self._birth_globalkf_id.reshape(-1).shape[0])
+        if old_len == target_len:
+            return
+
+        if self._globalkf_id.reshape(-1).shape[0] == target_len:
+            self._birth_globalkf_id = self._globalkf_id.detach().clone().to(self.device, dtype=torch.long).reshape(-1)
+        else:
+            birth_ids = self._birth_globalkf_id.to(self.device, dtype=torch.long).reshape(-1)
+            if old_len > target_len:
+                self._birth_globalkf_id = birth_ids[:target_len]
+            else:
+                pad_len = target_len - old_len
+                pad_value = 0
+                if self._globalkf_id.numel() > 0:
+                    pad_value = int(self._globalkf_id.reshape(-1)[-1].item())
+                pad = torch.full((pad_len,), pad_value, dtype=torch.long, device=self.device)
+                self._birth_globalkf_id = torch.cat((birth_ids, pad), dim=0)
+
+        print(
+            f"Repaired _birth_globalkf_id length during {context}: {old_len} -> {target_len}",
+            flush=True,
+        )
+
+    def _validate_record_lengths_for_prune(self, prune_mask):
+        expected_len = int(prune_mask.shape[0])
+        for name in (
+            "_local_scores",
+            "_global_scores",
+            "_stable_mask",
+            "_globalkf_id",
+            "_globalkf_max_scores",
+        ):
+            tensor_len = int(getattr(self, name).shape[0])
+            if tensor_len != expected_len:
+                raise ValueError(
+                    f"{name} length {tensor_len} does not match prune mask length {expected_len}"
+                )
     
-    def update_records(self, mode=None, densify_gaussiannum=None, prune_gaussianmask=None):
+    def update_records(
+        self,
+        mode=None,
+        densify_gaussiannum=None,
+        prune_gaussianmask=None,
+        densify_globalkf_id=None,
+        densify_birth_globalkf_id=None,
+    ):
         if mode == "densify":
+            self._ensure_birth_record_length(self._globalkf_id.reshape(-1).shape[0], "densify")
+            if densify_globalkf_id is None:
+                densify_globalkf_id = torch.zeros(
+                    (densify_gaussiannum,),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+            else:
+                densify_globalkf_id = densify_globalkf_id.to(self.device, dtype=torch.long).reshape(-1)
+            if densify_globalkf_id.shape[0] != densify_gaussiannum:
+                raise ValueError("densify_globalkf_id must match densify_gaussiannum")
+
+            if densify_birth_globalkf_id is None:
+                densify_birth_globalkf_id = densify_globalkf_id
+            else:
+                densify_birth_globalkf_id = densify_birth_globalkf_id.to(self.device, dtype=torch.long).reshape(-1)
+            if densify_birth_globalkf_id.shape[0] != densify_gaussiannum:
+                raise ValueError("densify_birth_globalkf_id must match densify_gaussiannum")
+
             self._local_scores  = torch.cat((self._local_scores, torch.zeros((densify_gaussiannum, 2), dtype=torch.float32, device=self.device)), dim=0)
             self._global_scores = torch.cat((self._global_scores, torch.zeros((densify_gaussiannum, 2), dtype=torch.float32, device=self.device)), dim=0)
             self._stable_mask   = torch.cat((self._stable_mask, torch.zeros((densify_gaussiannum, ), dtype=torch.bool, device=self.device)), dim=0)        
-            self._globalkf_id         = torch.cat((self._globalkf_id, torch.zeros((densify_gaussiannum, ), dtype=torch.long, device=self.device)), dim=0)
+            self._globalkf_id         = torch.cat((self._globalkf_id, densify_globalkf_id), dim=0)
             self._globalkf_max_scores = torch.cat((self._globalkf_max_scores, torch.zeros((densify_gaussiannum, ), dtype=torch.float32, device=self.device)), dim=0)
+            self._birth_globalkf_id   = torch.cat((self._birth_globalkf_id, densify_birth_globalkf_id), dim=0)
             
         elif mode == "prune":
-            self._local_scores  = self._local_scores[~prune_gaussianmask]
-            self._global_scores = self._global_scores[~prune_gaussianmask]
-            self._stable_mask   = self._stable_mask[~prune_gaussianmask.reshape(-1)]
-            self._globalkf_id         = self._globalkf_id[~prune_gaussianmask.reshape(-1)]
-            self._globalkf_max_scores = self._globalkf_max_scores[~prune_gaussianmask.reshape(-1)]
+            prune_mask = prune_gaussianmask.to(self.device, dtype=torch.bool).reshape(-1)
+            self._ensure_birth_record_length(prune_mask.shape[0], "prune")
+            self._validate_record_lengths_for_prune(prune_mask)
+            keep_mask = ~prune_mask
+            self._local_scores  = self._local_scores[keep_mask]
+            self._global_scores = self._global_scores[keep_mask]
+            self._stable_mask   = self._stable_mask[keep_mask]
+            self._globalkf_id         = self._globalkf_id[keep_mask]
+            self._globalkf_max_scores = self._globalkf_max_scores[keep_mask]
+            self._birth_globalkf_id   = self._birth_globalkf_id[keep_mask]
         else:
             assert False, "Invalid mode."
+
+    @staticmethod
+    def _logit_scalar(value):
+        value = min(max(float(value), 1e-6), 1.0 - 1e-6)
+        return float(np.log(value / (1.0 - value)))
+
+    def splat_artifact_control(self):
+        control_cfg = self.cfg.get("gaussian_control", {}) or {}
+        if not control_cfg.get("enabled", False) or self._xyz.numel() == 0:
+            return
+
+        min_scale = max(float(control_cfg.get("min_scale", 5e-4)), 1e-12)
+        max_scale = max(float(control_cfg.get("max_scale", 0.08)), min_scale)
+        prune_scale = float(control_cfg.get("prune_scale", 0.5))
+        min_scale_log = float(np.log(min_scale))
+        max_scale_log = float(np.log(max_scale))
+        min_opacity_logit = self._logit_scalar(control_cfg.get("min_opacity", 1e-4))
+        max_opacity_logit = self._logit_scalar(control_cfg.get("max_opacity", 0.98))
+
+        with torch.no_grad():
+            finite_mask = (
+                torch.isfinite(self._xyz).all(dim=1)
+                & torch.isfinite(self._rgb).all(dim=1)
+                & torch.isfinite(self._scaling).all(dim=1)
+                & torch.isfinite(self._rotation).all(dim=1)
+                & torch.isfinite(self._opacity).all(dim=1)
+            )
+            prune_mask = ~finite_mask if control_cfg.get("prune_nonfinite", True) else torch.zeros_like(finite_mask)
+            if prune_scale > 0:
+                prune_mask = prune_mask | (self._scaling.detach().amax(dim=1) > float(np.log(prune_scale)))
+
+            num_pruned = int(prune_mask.sum().item())
+
+        if num_pruned > 0 and num_pruned < self._xyz.shape[0] and hasattr(self, "optimizer"):
+            new_dict = self.prune_tensors_from_optimizer(self.optimizer, prune_mask)
+            self.update_properties(new_dict)
+            self.update_records(mode="prune", prune_gaussianmask=prune_mask)
+
+        with torch.no_grad():
+            self._xyz.data.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+            if control_cfg.get("clamp_rgb", True):
+                self._rgb.data.nan_to_num_(nan=0.0, posinf=1.0, neginf=0.0)
+                self._rgb.data.clamp_(0.0, 1.0)
+            self._scaling.data.nan_to_num_(nan=max_scale_log, posinf=max_scale_log, neginf=min_scale_log)
+            self._scaling.data.clamp_(min_scale_log, max_scale_log)
+            self._opacity.data.nan_to_num_(nan=min_opacity_logit, posinf=max_opacity_logit, neginf=min_opacity_logit)
+            self._opacity.data.clamp_(min_opacity_logit, max_opacity_logit)
+
+            bad_rotation = ~torch.isfinite(self._rotation).all(dim=1)
+            if bad_rotation.any():
+                self._rotation.data[bad_rotation] = 0.0
+                self._rotation.data[bad_rotation, 0] = 1.0
     
     def stablemask_control(self, current_iter):
         if (current_iter == self.cfg['training_args']['iters'] - 1) and \
@@ -211,6 +403,8 @@ class GaussianModel(GaussianBase):
             # split_gaussianmask = (avg_error_scores > 0.3) & (~self._stable_mask) & (self._local_scores[:, 0] > 0.1)
             split_gaussianmask = (self._local_scores[:, 1] > ERROR_THRESHOLD) & (~self._stable_mask)
             subgaussian_dict   = get_split_properties(self, split_gaussianmask)
+            split_globalkf_id = self._globalkf_id[split_gaussianmask].repeat(3)
+            split_birth_globalkf_id = self._birth_globalkf_id[split_gaussianmask].repeat(3)
 
             new_dict = self.prune_tensors_from_optimizer(self.optimizer, split_gaussianmask)
             self.update_properties(new_dict)
@@ -218,7 +412,12 @@ class GaussianModel(GaussianBase):
 
             new_dict = self.cat_tensors_to_optimizer(self.optimizer, subgaussian_dict)
             self.update_properties(new_dict)
-            self.update_records(mode="densify", densify_gaussiannum=subgaussian_dict['_xyz'].shape[0])
+            self.update_records(
+                mode="densify",
+                densify_gaussiannum=subgaussian_dict['_xyz'].shape[0],
+                densify_globalkf_id=split_globalkf_id,
+                densify_birth_globalkf_id=split_birth_globalkf_id,
+            )
             # print("Split Gaussians: ", split_gaussianmask.sum().item())
 
         # Densify Gaussians: pixel-level, where RGB error or Depth error is large.
@@ -514,7 +713,10 @@ class GaussianModel(GaussianBase):
             rgb_loss   = 0.8 * l1_loss(rendered_image, gt_rgb, valid_mask) +\
                         0.2 * (1.0 - ssim_loss(rendered_image, gt_rgb, valid_mask))
                         
-            rgb_loss.backward()
+            rectified_poses_live = torch.matmul(SE3(optimize_c2c_tqs).matrix(), poses)
+            pose_loss = rgb_loss + self._pose_altitude_loss(batch, rectified_poses_live)
+
+            pose_loss.backward()
             self.pose_optimizer.step()
             self.pose_optimizer.zero_grad()
         
@@ -625,7 +827,10 @@ class GaussianModel(GaussianBase):
             rgb_loss   = 0.8 * l1_loss(rendered_image, gt_rgb, valid_mask) +\
                         0.2 * (1.0 - ssim_loss(rendered_image, gt_rgb, valid_mask))
                         
-            rgb_loss.backward()
+            rectified_poses_live = torch.matmul(SE3(optimize_c2c_tqs).matrix(), poses)
+            pose_loss = rgb_loss + self._pose_altitude_loss(batch, rectified_poses_live)
+
+            pose_loss.backward()
             
             self.pose_optimizer.step()
             self.pose_optimizer.zero_grad()
@@ -740,7 +945,10 @@ class GaussianModel(GaussianBase):
             rgb_loss   = 0.8 * l1_loss(rendered_image, gt_rgb, valid_mask) +\
                         0.2 * (1.0 - ssim_loss(rendered_image, gt_rgb, valid_mask))
                         
-            rgb_loss.backward()
+            rectified_poses_live = torch.matmul(SE3(optimize_c2c_tqs).matrix(), poses)
+            pose_loss = rgb_loss + self._pose_altitude_loss(batch, rectified_poses_live)
+
+            pose_loss.backward()
             
             self.pose_optimizer.step()
             self.pose_optimizer.zero_grad()

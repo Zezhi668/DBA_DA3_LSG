@@ -2,9 +2,31 @@ import torch
 import cv2
 import numpy as np
 import sys
-sys.path.append('/data/wuke/workspace/VINGS-Mono/submodules/')
+from pathlib import Path
+
+SUBMODULES_ROOT = Path(__file__).resolve().parents[2] / "submodules"
+if str(SUBMODULES_ROOT) not in sys.path:
+    sys.path.insert(0, str(SUBMODULES_ROOT))
+
 from metric_modules import Metric
 # from metric.metric3d import Metric3D_Model
+
+
+def _validate_checkpoint_file(checkpoint_path: Path) -> None:
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Metric checkpoint not found: {checkpoint_path}")
+
+    with checkpoint_path.open("rb") as f:
+        header = f.read(256).lstrip()
+
+    if header.startswith(b"<!doctype html") or header.startswith(b"<html"):
+        raise RuntimeError(
+            "Metric checkpoint is an HTML page, not a PyTorch weight file: {}. "
+            "This usually means it was downloaded from a Hugging Face `.../blob/...` "
+            "URL instead of `.../resolve/...`. Re-download "
+            "`metric_depth_vit_small_800k.pth` with the `/resolve/main/` link."
+            .format(checkpoint_path)
+        )
 
 class Metric_Model:
     def __init__(self, cfg, u_scale=None, v_scale=None):
@@ -22,8 +44,8 @@ class Metric_Model:
         '''
         Metric3D
         '''
-        import os
-        ckpt_path = 'ckpts/metric_depth_vit_small_800k.pth'
+        ckpt_path = Path('ckpts/metric_depth_vit_small_800k.pth')
+        _validate_checkpoint_file(ckpt_path)
         # self.predictor = Metric(checkpoint='/data/wuke/workspace/droid_metric/weights/metric_depth_vit_small_800k.pth', model_name='v2-S')
         self.predictor = Metric(checkpoint=ckpt_path, model_name='v2-S')
         if u_scale is None:

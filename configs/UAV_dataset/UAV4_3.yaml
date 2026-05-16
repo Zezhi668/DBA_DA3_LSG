@@ -1,0 +1,166 @@
+use_wandb: False
+use_sky: False
+use_dynamic: False
+use_loop: False
+use_pose_refine: False
+use_metric: False
+debug_mode: False
+
+da3:
+  enabled: True
+  model_id: depth-anything/DA3METRIC-LARGE
+  model_name: da3metric-large
+  source_dir: /home/server/VINGS_work/Depth-Anything-3/src
+  model_dir: /home/server/VINGS_work/DPT-LSG/ckpts/DA3Metric-Large
+  checkpoint_path: null
+  precision: float16
+  process_res: 504
+  process_res_method: upper_bound_resize
+  async: False
+  keyframe_only: True
+  seed_initialized_window: True
+  max_seed_keyframes: 8
+  frontend_refine_updates: 1
+  canonical_focal_scale: True
+  depth_scale: 1.0
+  min_depth: 0.2
+  max_depth: 300.0
+  replace_existing_depth: True
+
+constant_altitude:
+  enabled: True
+  lambda_alt: 0.01
+  backend_pose_refine: True
+  axis: 2
+  huber_delta: 2.0
+  anchor_mode: submap_first
+
+mode: 'vo'
+
+device:
+  tracker: 'cuda:0'
+  mapper: 'cuda:0'
+
+dataset:
+  root: /media/server/yzz_disk/small_city_triple_cam_0309/cam3_0309/
+  # gt_pose_path: /media/server/yzz_disk/cam3_pose_GT_part1/groundtruth.txt #enable if it's not small city
+  module: datasets.hierarchical #if it's just a folder with images inside,use: datasets.uav_image_folder
+  rgb_strip: 1
+  image_extensions: ['.png', '.PNG']
+
+middleware:
+  cov_times: 1000
+  max_cov: 3e3
+  max_depth: 80
+
+output:
+  save_dir: /home/server/output/DPT-LSG_output/
+
+memory_monitor:
+  enabled: True
+  interval: 1
+
+intrinsic:
+  H: 480
+  W: 640
+  fu: 403.044
+  fv: 403.044
+  cu: 192.218
+  cv: 328.248
+  resolution_scale: 1.0
+  bg: 0
+
+frontend:
+  weight: /home/server/VINGS_work/DPT-LSG/ckpts/droid.pth
+  image_size: [480, 640]
+  buffer: 80
+  filter_thresh: 0.5
+  c2i: None
+  visual_only: 1
+  warm_up: 8
+  beta: 0.3
+  frontend_nms: 1
+  keyframe_thresh: 4.0
+  frontend_window: 5
+  frontend_thresh: 16.0
+  frontend_radius: 2
+  active_window: 12
+  max_factors: 48
+  far_threshold: 0.02
+  inac_range: 3
+  mask_threshold: -1.0
+  skip_edge: [-4, -5, -6]
+  translation_threshold: 0.5
+  show_plot: False
+
+adc_args:
+  accum_thresh: 0.98
+
+training_args:
+  num_keyframe: 8
+  iters: 50
+  lr:
+    _xyz_lr: 0.0001
+    _rgb_lr: 0.0005
+    _opacity_lr: 0.05
+    _scaling_lr: 0.001
+    _rotation_lr: 0.001
+  loss_weights:
+    rgb_loss: 1.0
+    depth_loss: 1.0
+    alpha_loss: 1.0
+    normal_loss: 0.1
+    dist_loss: 0.0
+
+use_vis: False
+vis:
+  bev_w2c: [[1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 5],
+            [0, 0, 0, 1]]
+  bev_intrinsic_dict:
+    H: 480
+    W: 640
+    fu: 403.044
+    fv: 403.044
+    cu: 192.218
+    cv: 328.248
+  pose_scale: 1.0
+
+use_storage_manager: True
+storage_manager:
+  distance_threshold: 30.0
+
+submap:
+  enabled: True
+  max_keyframes: 80
+  max_translation: 120.0
+  overlap_keyframes: 4
+  loop_every: 3
+  loop_min_separation: 20
+  retrieval_top_submaps: 3
+  retrieval_top_keyframes: 2
+  validation_accum_threshold: 0.85
+  validation_error_threshold: 0.16
+  validation_min_matches: 40
+  pose_jump_threshold: 25.0
+  refine_affected_submaps: False
+  refine_iters: 10
+  storage_interval: 10
+  altitude:
+    enabled: True
+    lambda_alt: 0.01
+    axis: 2
+    huber_delta: 2.0
+    anchor_mode: submap_first
+
+looper:
+  lightglue_weight_dir: /home/server/VINGS_work/DPT-LSG/ckpts/lightglue/
+  onnx_w: 512
+  H: 480
+  W: 640
+  loop_radius: 15
+  is_loop_min_match_num: 40
+  search_num: 30
+  is_loop_mse_threshold: 0.16
+  is_loop_med_times: 100.0

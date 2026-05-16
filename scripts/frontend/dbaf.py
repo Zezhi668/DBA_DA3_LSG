@@ -5,6 +5,7 @@ from frontend.droid_net import DroidNet
 from frontend.depth_video import DepthVideo
 from frontend.motion_filter import MotionFilter
 from frontend.dbaf_frontend import DBAFusionFrontend
+from frontend.da3_depth_prior import DroidDA3DepthPrior
 from collections import OrderedDict
 from torch.multiprocessing import Process
 import gtsam
@@ -32,6 +33,7 @@ class DBAFusion:
         
         # frontend process
         self.frontend = DBAFusionFrontend(self.net, self.video, self.cfg)
+        self.da3_depth_prior = DroidDA3DepthPrior.from_cfg(self.cfg)
         
         self.frontend.translation_threshold  = 0.2
         self.frontend.graph.mask_threshold   = -1.0
@@ -59,14 +61,33 @@ class DBAFusion:
         """ main thread - update map """
         tstamp, image, intrinsic = data_packet['timestamp'], data_packet['rgb'], data_packet['intrinsic']
         with torch.no_grad():
+            self.da3_depth_prior.poll_ready(self.video)
+            was_initialized = self.frontend.is_initialized
             # check there is enough motion
             depth = None if 'depth' not in list(data_packet.keys()) else data_packet['depth']
             self.filterx.track(tstamp, image, depth, intrinsic)
             # local bundle adjustment
             self.frontend()
+            self.da3_depth_prior.poll_ready(self.video)
+
+            if self.frontend.is_initialized and not was_initialized:
+                self.da3_depth_prior.seed_initialized_window(
+                    self.video,
+                    self.frontend.t1,
+                    graph=self.frontend.graph,
+                )
+
+            if self.frontend.is_initialized and self.frontend.new_frame_added:
+                da3_kf_index = self.frontend.t1 - 2
+                self.da3_depth_prior.on_keyframe(
+                    self.video,
+                    da3_kf_index,
+                    graph=self.frontend.graph,
+                )
 
     def terminate(self, stream=None):
         """ terminate the visualization process, return poses [t, q] """
+        self.da3_depth_prior.close()
         del self.frontend
 
     # Tailored for debug Looper.

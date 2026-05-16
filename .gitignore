@@ -1,6 +1,30 @@
 __pycache__/
+*.py[cod]
+*$py.class
+
 .vscode/
+.idea/
+.codex
+.codex/
+.agents/
+
+# Local build products.
+build/
+build_gtsam/
 build_gtsam/*
+submodules/**/build/
+dbaf/**/build/
+*.egg-info/
+
+# Local runtime outputs and heavy assets. Upload these separately.
+/ckpts/
+/output/
+/outputs/
+/results/
+/logs/
+/wandb/
+/datasets/
+/data/
+
+# Keep submodule gitlinks tracked.
 # submodules/*  # Commented out to allow submodules
-ckpts/*
-output/*

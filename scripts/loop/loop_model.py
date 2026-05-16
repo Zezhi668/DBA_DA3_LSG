@@ -17,6 +17,13 @@ class LoopModel:
         
         self.record_pair = []
 
+    def _loop_max_depth(self):
+        return float(
+            self.cfg.get('looper', {}).get(
+                'candidate_max_depth',
+                self.cfg.get('looper', {}).get('max_depth', 8.0),
+            )
+        )
     
     def accept_thisloop(self, kfid_loop_start, kfid_loop_end):
         if len(self.record_pair) == 0:
@@ -91,7 +98,7 @@ class LoopModel:
                 search_history_kf_index = search_sorted_history_kf_index[idx]
                 gt_img1, c2w1           = history_kf_dict['rgb'][search_history_kf_index], history_kf_dict['c2w'][search_history_kf_index]
                 gt_depth2               = curr_frame_dict['depth'].clone() + 0.0
-                gt_depth2[gt_depth2>8] = 0.0
+                gt_depth2[gt_depth2 > self._loop_max_depth()] = 0.0
                 # gt_depth2 = None
                 c2w2                    = curr_frame_dict['c2w'].clone()
                 pred_img1, mask_error   = self.detector.detect_loop(gt_img1, gt_img2, c2w2, gt_depth2, gaussian_model)
@@ -115,16 +122,18 @@ class LoopModel:
             gt_img1, c2w1 = history_kf_dict['rgb'][loopstart_kf_id], history_kf_dict['c2w'][loopstart_kf_id]
             tstamp1       = history_kf_dict['viz_out_idx_to_f_idx'][loopstart_kf_id]
             gt_depth2               = curr_frame_dict['depth'].clone() + 0.0
-            gt_depth2[gt_depth2>8] = 0.0
+            gt_depth2[gt_depth2 > self._loop_max_depth()] = 0.0
             # gt_depth2 = None
             with torch.no_grad():
                 c2w2 = curr_frame_dict['c2w']
                 pred_img1, debug_dict = self.detector.detect_loop(gt_img1, gt_img2, c2w2, gt_depth2, gaussian_model, debug=True)
+                if pred_img1 is None or not isinstance(debug_dict, dict) or 'c2w1' not in debug_dict:
+                    return False, None
                 kfid_loop_start       = loopstart_kf_id
                 kfid_loop_end         = curr_frame_dict['idx']
                 tstamp2               = history_kf_dict['viz_out_idx_to_f_idx'][kfid_loop_end]
                 # c2w_loop_start2end    = debug_dict['c2w1'].inverse() @ c2w2
-                c2w_loop_start2end    = c2w2.inverse() @ debug_dict['c2w1']
+                c2w_loop_start2end    = torch.linalg.inv(c2w2) @ debug_dict['c2w1']
                 loopdetect_dict['c2w_start2end'] = c2w_loop_start2end
                 loopdetect_dict['start_kf_idx']  = kfid_loop_start
                 loopdetect_dict['end_kf_idx']    = kfid_loop_end
@@ -349,5 +358,4 @@ class LoopModel:
                 
         else:
             pass
-        
         

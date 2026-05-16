@@ -40,6 +40,7 @@ class GaussianBase:
         self._stable_mask   = torch.empty(0)
         self._globalkf_id         = torch.empty(0)
         self._globalkf_max_scores = torch.empty(0)
+        self._birth_globalkf_id   = torch.empty(0)
         
         self.activate_dict = {'_scaling': torch.exp,
                               '_opacity': torch.sigmoid,
@@ -48,6 +49,23 @@ class GaussianBase:
                               'inv_opacity': inverse_sigmoid}
 
         self.initialized_state = False
+
+    def pose_refine_enabled(self):
+        if bool(self.cfg.get('use_refine', self.cfg.get('use_pose_refine', False))):
+            return True
+        altitude_cfg = self.cfg.get('constant_altitude', {})
+        return bool(
+            altitude_cfg.get('enabled', False)
+            and float(altitude_cfg.get('lambda_alt', 0.0)) > 0.0
+            and altitude_cfg.get('backend_pose_refine', True)
+        )
+
+    @staticmethod
+    def _batch_has_valid_depth(batch):
+        depths = batch.get("depths")
+        if depths is None or not torch.is_tensor(depths):
+            return False
+        return bool((torch.isfinite(depths) & (depths > 0)).reshape(depths.shape[0], -1).any(dim=1).any().item())
     
     def setup_optimizer(self):
         cfg = self.cfg
@@ -137,6 +155,8 @@ class GaussianBase:
             new_added_dict['image'] = processed_dict['images'][new_id]
             new_added_dict['cov'] = processed_dict['depths_cov'][new_id]
             new_added_dict['intrinsic'] = processed_dict['intrinsic']
+            if 'global_kf_id' in processed_dict:
+                new_added_dict['global_kf_id'] = processed_dict['global_kf_id'][new_id]
             return True, new_added_dict
 
     def render_raw(self, w2c, intrinsic_dict, unopt_gaussian_mask = None):
@@ -351,6 +371,8 @@ class GaussianBase:
         # pixel_masks        = batch["pixel_mask"]              # (N, 344, 616)
         
         for curr_iter in range(train_iters):
+            if curr_iter == 0 and hasattr(self, "splat_artifact_control"):
+                self.splat_artifact_control()
             
             self.wandber.log_time('forward_time')
 
@@ -365,6 +387,10 @@ class GaussianBase:
             w2c = torch.linalg.inv(c2w)
             
             pred_dict = self.render(w2c, intrinsic_dict, None, w2c2=torch.linalg.inv(poses[min(curr_id+1, poses.shape[0]-1)]))
+            if not torch.any(pred_dict['radii'] > 0):
+                self.optimizer.zero_grad()
+                continue
+
             gt_dict = {'rgb': images[curr_id].permute(2,0,1), 'depth': depths[curr_id].permute(2,0,1), 'uncert': depths_cov[curr_id].permute(2,0,1), 'c2w': c2w}
             gt_dict['depth_cov'] = depths_cov[curr_id].permute(2,0,1)
             
@@ -401,6 +427,8 @@ class GaussianBase:
             radii[self._stable_mask] = 0
             self.optimizer.step(radii > 0, radii.shape[0])
             self.optimizer.zero_grad()
+            if hasattr(self, "splat_artifact_control"):
+                self.splat_artifact_control()
             self.wandber.log_time('step_time')
 
             if self.cfg['use_sky']:
@@ -411,7 +439,7 @@ class GaussianBase:
             # self.wandber.log_time('Time_PerIter')
 
             # TTD 2024/12/29 dangerous option.
-            if True and curr_iter == train_iters - 1:
+            if (not batch.get("skip_viz", False)) and curr_iter == train_iters - 1:
                 gt_dict['pose'] = c2w
                 gt_dict['abs_frame_idx_list'] = batch["viz_out_idx_to_f_idx"]
                 frame_id = batch["viz_out_idx_to_f_idx"][curr_id]
@@ -450,14 +478,14 @@ class GaussianBase:
                 self.add_new_frame(new_added_dict)
                 
                 # TTD 2024/11/17
-                if 'use_refine' in self.cfg.keys() and self.cfg['use_refine']:        
+                if self.pose_refine_enabled():
                    new_poses        = self.train_once_pose(processed_dict)
                    processed_dict['poses'] = new_poses
                 
                 # Excellent Option.
                 self.train_once(processed_dict, self.cfg['training_args']['iters']) 
                 
-                if 'use_refine' in self.cfg.keys() and self.cfg['use_refine']:    
+                if self.pose_refine_enabled():
                     if return_vizout:
                         new_poses        = self.train_once_pose(processed_dict)
                         processed_dict['poses'] = new_poses
@@ -467,6 +495,9 @@ class GaussianBase:
             # Dangerous Option.
             # self.train_once(processed_dict, self.cfg['training_args']['iters'])
         else:
+            if not self._batch_has_valid_depth(processed_dict):
+                print("Skipping Gaussian initialization: batch has no valid depth.", flush=True)
+                return None
             self.init_first_frame(processed_dict)
             self.initialized_state = True
             self.setup_optimizer()
@@ -501,6 +532,7 @@ class GaussianBase:
             '_stable_mask': self._stable_mask,
             '_globalkf_id': self._globalkf_id,
             '_globalkf_max_scores': self._globalkf_max_scores,
+            '_birth_globalkf_id': self._birth_globalkf_id,
         }
         torch.save(ckpt_dict, ckpt_path)
     
@@ -516,6 +548,10 @@ class GaussianBase:
         self._stable_mask         = ckpt_dict['_stable_mask']
         self._globalkf_id         = ckpt_dict['_globalkf_id']
         self._globalkf_max_scores = ckpt_dict['_globalkf_max_scores']
+        if '_birth_globalkf_id' in ckpt_dict:
+            self._birth_globalkf_id = ckpt_dict['_birth_globalkf_id']
+        else:
+            self._birth_globalkf_id = self._globalkf_id.clone()
         
         self.setup_optimizer()
         # Please remember to set tfer before render.
@@ -529,4 +565,3 @@ class GaussianBase:
         processed_dict_new = self.run_only_mapping(processed_dict, return_vizout)
         
         return processed_dict_new
-

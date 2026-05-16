@@ -3,6 +3,18 @@ import shutil
 import torch
 from lietorch import SE3
 import os
+import sys
+
+
+SCRIPT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+
+REPO_ROOT = os.path.dirname(SCRIPT_ROOT)
+GTSAM_PYTHON_ROOT = os.path.join(REPO_ROOT, "submodules", "gtsam", "build", "python")
+if os.path.isdir(GTSAM_PYTHON_ROOT) and GTSAM_PYTHON_ROOT not in sys.path:
+    sys.path.insert(0, GTSAM_PYTHON_ROOT)
+
 from frontend.dbaf import DBAFusion
 from gaussian.gaussian_model import GaussianModel
 from gaussian.vis_utils import save_ply, vis_map
@@ -16,6 +28,7 @@ config = load_config(config_path)
 import importlib
 get_dataset = importlib.import_module(config["dataset"]["module"]).get_dataset
 from vings_utils.middleware_utils import judge_and_package, retrieve_to_tracker, datapacket_to_nerfslam
+from vings_utils.memory_monitor import MemoryMonitor
 from storage.storage_manage import StorageManager
 from loop.loop_model import LoopModel
 from metric.metric_model import Metric_Model
@@ -24,8 +37,12 @@ if config['mode'] == 'vo_nerfslam': from frontend_vo.vio_slam import VioSLAM
 from tqdm import tqdm
 from datasets.pth import Pth_Loader
 # -  -  -  -  -  -  -  -  -  -  -
-# PTH_DIR = '/data/wuke/workspace/Droid2DAcc/output/11-06-19-05-kintinuous/debug_dict'
-PTH_DIR = '/data/wuke/workspace/VINGS-Mono/output/12-22-15-28-hierarchical-smallcit-/vizout_dict'
+# PTH_DIR can be overridden for offline mapper replay.
+PTH_DIR = (
+    os.environ.get('DPT_LSG_PTH_DIR')
+    or os.environ.get('MAST3R_LSG_PTH_DIR')
+    or os.path.join(config['output']['save_dir'], 'vizout_dict')
+)
 # -  -  -  -  -  -  -  -  -  -  -
 
 
@@ -34,6 +51,7 @@ PTH_DIR = '/data/wuke/workspace/VINGS-Mono/output/12-22-15-28-hierarchical-small
 class Runner:
     def __init__(self, cfg):
         self.cfg = cfg
+        self.memory_monitor = MemoryMonitor(cfg, label="run_mapping")
         self.dataset  = get_dataset(cfg)
         cfg['frontend']['c2i'] = self.dataset.c2i # (4, 4), ndarray
         
@@ -50,6 +68,8 @@ class Runner:
                 self.storage_manager.dataset_length = self.dataset.rgbinfo_dict['timestamp'][-1] - self.dataset.rgbinfo_dict['timestamp'][0] 
         else:
             self.use_storage_manager = False
+        
+        self.memory_monitor.record(-1, tag="post_init", force=True)
     
     
     def vizout_to_mapperinput(self, viz_out):
@@ -76,19 +96,29 @@ class Runner:
 
 
     def run(self):
-        for idx in tqdm(range(0, len(self.pth_loader))):
-            viz_out = self.pth_loader.load_data(idx) 
-            torch.cuda.empty_cache()
-            # self.mapper.run(self.vizout_to_mapperinput(viz_out))
-            # print(viz_out.keys())
-            self.mapper.run(viz_out)
-            
-            if self.use_storage_manager and (idx+1) % 10 == 0:
-                self.storage_manager.run(self.tracker, self.mapper, viz_out)
+        try:
+            for idx in tqdm(range(0, len(self.pth_loader))):
+                viz_out = self.pth_loader.load_data(idx) 
                 torch.cuda.empty_cache()
-            
-            if ((idx+1) % 500 == 0 or (idx == len(self.dataset) - 1)) and self.mapper._xyz.shape[0] > 0:
-                save_ply(self.mapper, idx, save_mode='2dgs')
+                # self.mapper.run(self.vizout_to_mapperinput(viz_out))
+                # print(viz_out.keys())
+                self.mapper.run(viz_out)
+                
+                if self.use_storage_manager and (idx+1) % 10 == 0:
+                    self.storage_manager.run(self.tracker, self.mapper, viz_out)
+                    torch.cuda.empty_cache()
+
+                self.memory_monitor.record(idx, tag="mapping_step")
+                
+                if ((idx+1) % 500 == 0 or (idx == len(self.dataset) - 1)) and self.mapper._xyz.shape[0] > 0:
+                    save_ply(
+                        self.mapper,
+                        idx,
+                        save_mode='2dgs',
+                        storage_manager=self.storage_manager if self.use_storage_manager else None,
+                    )
+        finally:
+            self.memory_monitor.close()
            
              
 if __name__ == '__main__':

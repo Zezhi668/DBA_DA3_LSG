@@ -1,0 +1,191 @@
+use_wandb: False
+use_sky: False
+use_dynamic: False
+use_loop: True
+use_pose_refine: False
+use_metric: False
+debug_mode: False
+
+da3:
+  enabled: True
+  model_id: depth-anything/DA3METRIC-LARGE
+  model_name: da3metric-large
+  source_dir: /home/server/VINGS_work/Depth-Anything-3/src
+  model_dir: /home/server/VINGS_work/DPT-LSG/ckpts/DA3Metric-Large
+  checkpoint_path: /home/server/VINGS_work/DPT-LSG/ckpts/da3_mars_lvig_hkairport_amtown01_head.pth
+  precision: float16
+  process_res: 560
+  process_res_method: upper_bound_resize
+  async: True
+  max_pending: 2
+  seed_initialized_window: True
+  max_seed_keyframes: 4
+  frontend_refine_updates: 0
+  canonical_focal_scale: True
+  depth_scale: 1.0
+  min_depth: 0.5
+  max_depth: 300.0
+  replace_existing_depth: True
+  anchor_mode: scale
+  align_min_pixels: 512
+  align_trim: 0.1
+  align_min_scale: 0.5
+  align_max_scale: 2.0
+  align_min_shift: 0.0
+  align_max_shift: 0.0
+  align_blend: 0.35
+
+sim3_ransac_iters: 256
+sim3_inlier_threshold: 0.75
+sim3_min_inliers: 48
+
+mode: 'vo'
+
+device:
+  tracker: 'cuda:0'
+  mapper: 'cuda:0'
+
+dataset:
+  root: /media/server/yzz_disk/Dataset_sx/MARS-LIVG/tum/HKisland03_trimmed
+  module: datasets.tumrgbd
+  rgb_strip: 1
+
+middleware:
+  cov_times: 1000
+  max_cov: 3e3
+  max_depth: 300
+
+gaussian_control:
+  enabled: True
+  min_scale: 0.0005
+  max_scale: 0.5
+  prune_scale: 1.0
+  export_prune_scale: 0.5
+  min_opacity: 0.0001
+  max_opacity: 0.98
+  clamp_rgb: True
+  prune_nonfinite: True
+  export_filter: True
+
+output:
+  save_dir: /home/server/output/DPT-LSG_output/
+
+memory_monitor:
+  enabled: True
+  interval: 1
+
+# Repo convention here is unusual:
+#   fu = fy, fv = fx, cu = cy, cv = cx
+# These values match HKisland03_trimmed/export_info.json.
+intrinsic:
+  H: 2047
+  W: 2447
+  fu: 1448.7803955078125
+  fv: 1450.1048583984375
+  cu: 1046.5909407438594
+  cv: 1178.6274959001748
+  resolution_scale: 1.0
+  bg: 0
+
+frontend:
+  weight: /home/server/VINGS_work/DPT-LSG/ckpts/droid.pth
+  image_size: [448, 560]
+  buffer: 80
+  filter_thresh: 2.4
+  c2i: None
+  warm_up: 8
+  beta: 0.3
+  frontend_nms: 1
+  keyframe_thresh: 3.0
+  frontend_window: 5
+  frontend_thresh: 16.0
+  frontend_radius: 2
+  active_window: 12
+  max_factors: 48
+  far_threshold: 0.0
+  inac_range: 3
+  mask_threshold: -1.0
+  skip_edge: [-4, -5, -6]
+  translation_threshold: 0.5
+  show_plot: False
+
+adc_args:
+  accum_thresh: 0.995
+
+training_args:
+  num_keyframe: 8
+  iters: 50
+  lr:
+    _xyz_lr: 0.0001
+    _rgb_lr: 0.0005
+    _opacity_lr: 0.05
+    _scaling_lr: 0.001
+    _rotation_lr: 0.001
+  loss_weights:
+    rgb_loss: 1.0
+    depth_loss: 1.0
+    alpha_loss: 0.2
+    normal_loss: 0.1
+    dist_loss: 0.0
+
+use_vis: False
+vis:
+  bev_w2c: [[ 9.86264675e-01,  7.99505779e-02,  1.44533373e-01, -5.73378037e+01],
+            [ 2.78057407e-02,  7.82189932e-01, -6.22419273e-01,  3.97714933e+01],
+            [-1.62815330e-01,  6.17889000e-01,  7.69223214e-01,  1.44932682e+01],
+            [ 0.00000000e+00,  0.00000000e+00,  0.00000000e+00,  1.00000000e+00]]
+  bev_intrinsic_dict:
+    H: 758
+    W: 1372
+    fu: 656.44725606860459
+    fv: 656.44725606860459
+    cu: 378.5
+    cv: 685.5
+  pose_scale: 1.0
+
+use_storage_manager: True
+storage_manager:
+  distance_threshold: 60.0
+
+submap:
+  enabled: True
+  max_keyframes: 360
+  max_translation: 400.0
+  overlap_keyframes: 6
+  loop_every: 12
+  loop_min_separation: 60
+  retrieval_top_submaps: 2
+  retrieval_top_keyframes: 2
+  validation_accum_threshold: 0.9
+  validation_error_threshold: 0.12
+  validation_min_matches: 80
+  pose_jump_threshold: 45.0
+  seam_bridge_enabled: False
+  seam_bridge_every: 12
+  seam_bridge_ref_keyframes: 8
+  seam_bridge_min_matches: 80
+  seam_bridge_min_inliers: 60
+  seam_bridge_min_scale: 0.8
+  seam_bridge_max_scale: 1.25
+  seam_bridge_max_translation: 60.0
+  bootstrap_min_valid_pixels: 512
+  refine_affected_submaps: False
+  refine_iters: 10
+  storage_interval: 20
+  pose_graph:
+    seam_sigma: [0.05, 0.05, 0.05, 0.35, 0.35, 0.35, 0.04]
+
+looper:
+  lightglue_weight_dir: /home/server/VINGS_work/DPT-LSG/ckpts/lightglue/
+  onnx_w: 512
+  H: 448
+  W: 560
+  min_depth: 0.5
+  max_depth: 300.0
+  accum_threshold: 0.9
+  pose_jump_threshold: 45.0
+  loop_radius: 15
+  is_loop_min_match_num: 80
+  search_num: 16
+  is_loop_mse_threshold: 0.12
+  is_loop_med_times: 100.0

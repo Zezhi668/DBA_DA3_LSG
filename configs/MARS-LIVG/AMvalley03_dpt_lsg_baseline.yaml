@@ -1,0 +1,131 @@
+use_wandb: False
+use_sky: False
+use_dynamic: False
+use_loop: True
+use_pose_refine: False
+use_metric: True
+debug_mode: False
+
+# Controlled baseline run inside the DPT-LSG codebase.
+# DA3 and submaps are disabled so this can be compared against
+# VINGS-Mono-backup-20260325 on the same AMvalley03 sequence.
+da3:
+  enabled: False
+
+mode: 'vo'
+
+device:
+  tracker: 'cuda:0'
+  mapper: 'cuda:0'
+
+dataset:
+  root: /media/server/yzz_disk/Dataset_sx/MARS-LIVG/tum/AMvalley03_trimmed
+  module: datasets.tumrgbd
+  rgb_strip: 1
+
+middleware:
+  cov_times: 1000
+  max_cov: 3e3
+  max_depth: 80
+
+gaussian_control:
+  enabled: False
+
+output:
+  save_dir: /home/server/output/DPT-LSG_output/
+
+memory_monitor:
+  enabled: True
+  interval: 1
+
+# Repo convention here is unusual:
+#   fu = fy, fv = fx, cu = cy, cv = cx
+# These values match AMvalley03_trimmed/export_info.json.
+intrinsic:
+  H: 2047
+  W: 2447
+  fu: 1449.082763671875
+  fv: 1451.9288330078125
+  cu: 1049.3727199293498
+  cv: 1182.4370199916666
+  resolution_scale: 1.0
+  bg: 0
+
+frontend:
+  weight: /home/server/VINGS_work/DPT-LSG/ckpts/droid.pth
+  image_size: [344, 616]
+  buffer: 80
+  filter_thresh: 2.4
+  c2i: None
+  warm_up: 8
+  beta: 0.3
+  frontend_nms: 1
+  keyframe_thresh: 3.0
+  frontend_window: 5
+  frontend_thresh: 16.0
+  frontend_radius: 2
+  active_window: 12
+  max_factors: 48
+  far_threshold: 0.02
+  inac_range: 3
+  mask_threshold: -1.0
+  skip_edge: [-4, -5, -6]
+  translation_threshold: 0.5
+  show_plot: False
+
+adc_args:
+  accum_thresh: 0.98
+
+training_args:
+  num_keyframe: 8
+  iters: 50
+  lr:
+    _xyz_lr: 0.0001
+    _rgb_lr: 0.0005
+    _opacity_lr: 0.05
+    _scaling_lr: 0.001
+    _rotation_lr: 0.001
+  loss_weights:
+    rgb_loss: 1.0
+    depth_loss: 1.0
+    alpha_loss: 1.0
+    normal_loss: 0.1
+    dist_loss: 0.0
+
+use_vis: False
+vis:
+  bev_w2c: [[ 9.86264675e-01,  7.99505779e-02,  1.44533373e-01, -5.73378037e+01],
+            [ 2.78057407e-02,  7.82189932e-01, -6.22419273e-01,  3.97714933e+01],
+            [-1.62815330e-01,  6.17889000e-01,  7.69223214e-01,  1.44932682e+01],
+            [ 0.00000000e+00,  0.00000000e+00,  0.00000000e+00,  1.00000000e+00]]
+  bev_intrinsic_dict:
+    H: 758
+    W: 1372
+    fu: 656.44725606860459
+    fv: 656.44725606860459
+    cu: 378.5
+    cv: 685.5
+  pose_scale: 1.0
+
+use_storage_manager: True
+storage_manager:
+  distance_threshold: 60.0
+
+submap:
+  enabled: False
+
+looper:
+  lightglue_weight_dir: /home/server/VINGS_work/DPT-LSG/ckpts/lightglue/
+  onnx_w: 512
+  H: 344
+  W: 616
+  min_depth: 0.2
+  max_depth: 15.0
+  candidate_max_depth: 8.0
+  accum_threshold: 0.95
+  pose_jump_threshold: 15.0
+  loop_radius: 15
+  is_loop_min_match_num: 40
+  search_num: 30
+  is_loop_mse_threshold: 0.16
+  is_loop_med_times: 100.0

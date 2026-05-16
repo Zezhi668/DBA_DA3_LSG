@@ -12,7 +12,8 @@ opencv-python
 open3d
 icecream
 # Metric3D
-numpy
+numpy<2
+scipy
 colored_glog
 Pillow
 DateTime
@@ -33,3 +34,15 @@ kornia-moons==0.2.9
 onnx==1.16.1
 onnxruntime-gpu==1.18.1
 psutil
+
+# Optional DA3 depth-anchor integration. Install the local DA3 package with
+# `python -m pip install -e /home/server/VINGS_work/Depth-Anything-3 --no-deps`
+# so these packages do not replace the DPT-LSG torch/CUDA stack.
+huggingface_hub
+safetensors
+omegaconf
+einops
+addict
+pillow_heif
+typer
+requests

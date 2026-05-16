@@ -26,6 +26,7 @@ class StorageManager: # Works in the same thread as the mapper.
 
         self._globalkf_id         = torch.empty(0, dtype=torch.long,    device='cpu')
         self._globalkf_max_scores = torch.empty(0, dtype=torch.float32, device='cpu')
+        self._birth_globalkf_id   = torch.empty(0, dtype=torch.long,    device='cpu')
         self.c2ws_storage_place   = torch.empty(0, device='cpu') # Same size with global history keyframes, 0 means cpu and 1 means gpu.
 
         # Color Poses.
@@ -54,6 +55,7 @@ class StorageManager: # Works in the same thread as the mapper.
             self._stable_mask   = torch.concat((self._stable_mask[~delete_gaussian_mask], mapper._stable_mask[convey_gaussian_mask].cpu()), dim=0)
             self._globalkf_id         = torch.concat((self._globalkf_id[~delete_gaussian_mask], mapper._globalkf_id[convey_gaussian_mask].cpu()), dim=0)
             self._globalkf_max_scores = torch.concat((self._globalkf_max_scores[~delete_gaussian_mask], mapper._globalkf_max_scores[convey_gaussian_mask].cpu()), dim=0)
+            self._birth_globalkf_id   = torch.concat((self._birth_globalkf_id[~delete_gaussian_mask], mapper._birth_globalkf_id[convey_gaussian_mask].cpu()), dim=0)
             self.c2ws_storage_place[convey_kf_id] = 0
 
             # Update mapper.
@@ -86,6 +88,7 @@ class StorageManager: # Works in the same thread as the mapper.
             mapper._stable_mask   = torch.concat((mapper._stable_mask, self._stable_mask[convey_gaussian_mask].cuda()))
             mapper._globalkf_id         = torch.concat((mapper._globalkf_id, self._globalkf_id[convey_gaussian_mask].cuda()))
             mapper._globalkf_max_scores = torch.concat((mapper._globalkf_max_scores, self._globalkf_max_scores[convey_gaussian_mask].cuda()))
+            mapper._birth_globalkf_id   = torch.concat((mapper._birth_globalkf_id, self._birth_globalkf_id[convey_gaussian_mask].cuda()))
             mapper.setup_optimizer()
 
             self.c2ws_storage_place[convey_kf_id] = 1   
@@ -93,12 +96,26 @@ class StorageManager: # Works in the same thread as the mapper.
     
     def run(self, tracker, mapper, viz_out):
         # STEP 1 Update globalkf_c2ws.
-        globalkf_c2ws = torch.linalg.inv(tq_to_matrix(tracker.video.poses_save[:viz_out['global_kf_id'][-1]])) # (N, 4, 4)
+        if hasattr(tracker.video, "count_save"):
+            global_kf_count = int(tracker.video.count_save)
+        else:
+            global_kf_count = int(viz_out["global_kf_id"].max().item()) + 1
+
+        if global_kf_count <= 0:
+            return
+
+        globalkf_c2ws = torch.linalg.inv(tq_to_matrix(tracker.video.poses_save[:global_kf_count])) # (N, 4, 4)
         cur_c2w       = viz_out['poses'][-1] # (4, 4)
         distance_to_cur_c2w = torch.norm(torch.matmul(torch.linalg.inv(cur_c2w).unsqueeze(0).cpu(), globalkf_c2ws.cpu())[:, :3, -1], dim=-1) # (N, ), cpu
 
-        new_added_size = viz_out['global_kf_id'][-1] - self.c2ws_storage_place.shape[0]
-        self.c2ws_storage_place = torch.concat((self.c2ws_storage_place, torch.ones(new_added_size, dtype=torch.float32)), dim=0)
+        new_added_size = global_kf_count - self.c2ws_storage_place.shape[0]
+        if new_added_size > 0:
+            self.c2ws_storage_place = torch.concat(
+                (self.c2ws_storage_place, torch.ones(new_added_size, dtype=torch.float32)),
+                dim=0,
+            )
+        elif new_added_size < 0:
+            self.c2ws_storage_place = self.c2ws_storage_place[:global_kf_count]
 
         # STEP 2 
         self.cpu2gpu(mapper, distance_to_cur_c2w)

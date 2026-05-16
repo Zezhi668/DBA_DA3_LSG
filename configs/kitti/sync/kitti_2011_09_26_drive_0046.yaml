@@ -21,7 +21,7 @@ middleware:
   max_depth: 50
 
 output:
-  save_dir: /data/wuke/workspace/VINGS-Mono/output/
+  save_dir: /home/server/output/DPT-LSG_output/
 
 # 707.0912 707.0912 601.8873 183.1104
 intrinsic:
@@ -33,7 +33,7 @@ intrinsic:
   cv: 609.5593
 
 frontend:
-  weight: /data/wuke/workspace/VINGS-Mono/ckpts/droid.pth
+  weight: /home/server/VINGS_work/DPT-LSG/ckpts/droid.pth
   image_size: [240, 800]
   buffer: 80
   filter_thresh: 2.4

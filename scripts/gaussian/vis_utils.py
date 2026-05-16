@@ -74,8 +74,18 @@ def check_pcd_with_poses(pcd, poses, interp=1, scale=0.1, color=(1.0, 0.0, 0.0))
 
 def apply_colormap(image, cmap="viridis"):
     colormap = cm.get_cmap(cmap)
-    colormap = torch.tensor(colormap.colors).to(image.device)  # type: ignore
-    image_long = (image * 255).long()
+    if hasattr(colormap, "colors"):
+        color_values = colormap.colors  # type: ignore[attr-defined]
+    else:
+        color_values = colormap(np.linspace(0.0, 1.0, 256))[:, :3]
+    colormap = torch.tensor(color_values, dtype=torch.float32, device=image.device)
+    if colormap.shape[0] != 256:
+        sample_idx = torch.linspace(0, colormap.shape[0] - 1, 256, device=image.device)
+        colormap = colormap[sample_idx.round().long()]
+
+    image = torch.nan_to_num(image.to(torch.float32), nan=0.0, posinf=1.0, neginf=0.0)
+    image = torch.clamp(image, 0.0, 1.0)
+    image_long = torch.clamp((image * 255).round(), 0, 255).to(torch.long)
     image_long_min = torch.min(image_long)
     image_long_max = torch.max(image_long)
     assert image_long_min >= 0, f"the min value is {image_long_min}"
@@ -89,15 +99,27 @@ def apply_depth_colormap(
     far_plane = 6.0,
     cmap="turbo",
 ):
-    near_plane = near_plane or float(torch.min(depth))
-    far_plane = far_plane or float(torch.max(depth))
+    depth = depth.to(torch.float32)
+    finite_mask = torch.isfinite(depth)
+    valid_depth = depth[finite_mask]
+
+    if near_plane is None:
+        near_plane = float(valid_depth.min()) if valid_depth.numel() > 0 else 0.0
+    if far_plane is None:
+        far_plane = float(valid_depth.max()) if valid_depth.numel() > 0 else (near_plane + 1.0)
+
+    if not np.isfinite(near_plane):
+        near_plane = 0.0
+    if (not np.isfinite(far_plane)) or far_plane <= near_plane:
+        far_plane = near_plane + 1.0
 
     depth = (depth - near_plane) / (far_plane - near_plane + 1e-10)
+    depth = torch.nan_to_num(depth, nan=0.0, posinf=1.0, neginf=0.0)
     depth = torch.clip(depth, 0, 1)
-    # depth = torch.nan_to_num(depth, nan=0.0) # TODO(ethan): remove this
     colored_image = apply_colormap(depth, cmap=cmap)
 
     if accumulation is not None:
+        accumulation = torch.nan_to_num(accumulation.to(torch.float32), nan=0.0, posinf=1.0, neginf=0.0)
         colored_image = colored_image * accumulation + (1 - accumulation)
 
     return colored_image
@@ -128,7 +150,11 @@ def vis_rgbdnua(cfg, frame_id, pred_dict, gt_dict, return_image=False):
         os.makedirs(os.path.join(cfg['output']['save_dir'], 'uncert'), exist_ok=True)
         torch.save(gt_dict['uncert'].permute(1, 2, 0), os.path.join(cfg['output']['save_dir'], 'uncert', f'FrameId={str(frame_id.item()).zfill(5)}.pt'))
     
-    log_uncert = torch.log(gt_dict['uncert'].permute(1, 2, 0))
+    uncert = gt_dict['uncert'].permute(1, 2, 0).to(torch.float32)
+    valid_uncert = torch.isfinite(uncert) & (uncert > 0)
+    safe_uncert = torch.where(valid_uncert, uncert, torch.ones_like(uncert))
+    log_uncert = torch.log(safe_uncert)
+    log_uncert = torch.where(valid_uncert, log_uncert, torch.zeros_like(log_uncert))
     # log_uncert = gt_dict['uncert'].permute(1, 2, 0)
     colored_log_uncert = apply_depth_colormap(log_uncert, None, near_plane=None, far_plane=None)
 
@@ -203,7 +229,108 @@ def construct_list_of_attributes(save_mode):
         l.append('rot_{}'.format(i))
     return l
 
-def save_ply(gaussian_model, idx, save_mode='3dgs'):
+def _tensor_to_numpy(export_tensor):
+    return export_tensor.detach().cpu().numpy()
+
+
+def _concat_export_arrays(primary_tensor, storage_tensor=None):
+    primary_array = _tensor_to_numpy(primary_tensor)
+    if storage_tensor is None or storage_tensor.shape[0] == 0:
+        return primary_array
+    storage_array = _tensor_to_numpy(storage_tensor)
+    if primary_array.shape[0] == 0:
+        return storage_array
+    return np.concatenate((primary_array, storage_array), axis=0)
+
+
+def _collect_export_properties(gaussian_model, storage_manager=None):
+    storage_xyz = None
+    storage_rgb = None
+    storage_opacity = None
+    storage_scaling = None
+    storage_rotation = None
+
+    if storage_manager is not None:
+        storage_xyz = storage_manager._xyz
+        storage_rgb = storage_manager._rgb
+        storage_opacity = storage_manager._opacity
+        storage_scaling = storage_manager._scaling
+        storage_rotation = storage_manager._rotation
+
+    return {
+        'xyz': _concat_export_arrays(gaussian_model._xyz, storage_xyz),
+        'rgb': _concat_export_arrays(gaussian_model._rgb, storage_rgb),
+        'opacity': _concat_export_arrays(gaussian_model._opacity, storage_opacity),
+        'scaling': _concat_export_arrays(gaussian_model._scaling, storage_scaling),
+        'rotation': _concat_export_arrays(gaussian_model._rotation, storage_rotation),
+    }
+
+
+def _logit_scalar(value):
+    value = min(max(float(value), 1e-6), 1.0 - 1e-6)
+    return float(np.log(value / (1.0 - value)))
+
+
+def _apply_export_hygiene(export_properties, cfg):
+    control_cfg = cfg.get("gaussian_control", {}) or {}
+    if not control_cfg.get("enabled", False) or not control_cfg.get("export_filter", True):
+        return export_properties
+
+    xyz = export_properties['xyz']
+    rgb = export_properties['rgb']
+    opacity = export_properties['opacity']
+    scaling = export_properties['scaling']
+    rotation = export_properties['rotation']
+    if xyz.shape[0] == 0:
+        return export_properties
+
+    opacity_finite = np.isfinite(opacity).all(axis=1) if opacity.ndim > 1 else np.isfinite(opacity)
+    valid_mask = (
+        np.isfinite(xyz).all(axis=1)
+        & np.isfinite(rgb).all(axis=1)
+        & opacity_finite
+        & np.isfinite(scaling).all(axis=1)
+        & np.isfinite(rotation).all(axis=1)
+    )
+    export_prune_scale = float(control_cfg.get("export_prune_scale", control_cfg.get("prune_scale", 0.5)))
+    if export_prune_scale > 0:
+        valid_mask &= np.max(scaling, axis=1) <= float(np.log(export_prune_scale))
+
+    filtered = {}
+    for name, values in export_properties.items():
+        filtered[name] = values[valid_mask]
+
+    min_scale = max(float(control_cfg.get("min_scale", 5e-4)), 1e-12)
+    max_scale = max(float(control_cfg.get("max_scale", 0.08)), min_scale)
+    min_scale_log = float(np.log(min_scale))
+    max_scale_log = float(np.log(max_scale))
+    min_opacity_logit = _logit_scalar(control_cfg.get("min_opacity", 1e-4))
+    max_opacity_logit = _logit_scalar(control_cfg.get("max_opacity", 0.98))
+
+    if control_cfg.get("clamp_rgb", True):
+        filtered['rgb'] = np.clip(
+            np.nan_to_num(filtered['rgb'], nan=0.0, posinf=1.0, neginf=0.0),
+            0.0,
+            1.0,
+        )
+    filtered['opacity'] = np.clip(
+        np.nan_to_num(filtered['opacity'], nan=min_opacity_logit, posinf=max_opacity_logit, neginf=min_opacity_logit),
+        min_opacity_logit,
+        max_opacity_logit,
+    )
+    filtered['scaling'] = np.clip(
+        np.nan_to_num(filtered['scaling'], nan=max_scale_log, posinf=max_scale_log, neginf=min_scale_log),
+        min_scale_log,
+        max_scale_log,
+    )
+
+    removed = xyz.shape[0] - filtered['xyz'].shape[0]
+    if removed > 0:
+        print(f"Filtered {removed} artifact gaussians before PLY export.")
+    return filtered
+
+
+def save_ply(gaussian_model, idx, save_mode='3dgs', storage_manager=None, filename=None):
     '''
     save_mode: 2dgs, 3dgs, sky, pth
     '''
@@ -211,36 +338,39 @@ def save_ply(gaussian_model, idx, save_mode='3dgs'):
         C0 = 0.28209479177387814
         def RGB2SH(rgb):
             return (rgb - 0.5) / C0
-        max_sh_degree = 3
-        xyz = gaussian_model._xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz)
-        fused_color = RGB2SH(gaussian_model.get_property('_rgb').detach().float().cuda())
-        features = torch.zeros((fused_color.shape[0], 3, (max_sh_degree + 1) ** 2)).float().cuda() # torch.Size([182686, 3, 16])
-        features[:, :3, 0 ] = fused_color
-        features[:, 3:, 1:] = 0.0
-        f_dc = features[:,:,0:1].transpose(1, 2).cpu().numpy().reshape(features.shape[0], -1) # torch.Size([182686, 1, 3])
-        f_rest = features[:,:,1:].transpose(1, 2).cpu().numpy().reshape(features.shape[0], -1) # torch.Size([182686, 15, 3])
+        export_properties = _collect_export_properties(gaussian_model, storage_manager=storage_manager)
+        export_properties = _apply_export_hygiene(export_properties, gaussian_model.cfg)
+        xyz = export_properties['xyz']
+        f_dc = RGB2SH(export_properties['rgb']).astype(np.float32, copy=False)
         
-        opacities = gaussian_model._opacity.detach().cpu().numpy()
-        scale = gaussian_model._scaling.detach().cpu().numpy()
-        if save_mode == '3dgs' or save_mode == 'sky':
-            scale = np.concatenate((scale, -10 * np.ones((scale.shape[0], 1))), axis=1)
-        
-        rotation = gaussian_model._rotation.detach().cpu().numpy()
+        opacities = export_properties['opacity']
+        scale = export_properties['scaling']
+        rotation = export_properties['rotation']
 
         dtype_full = [(attribute, 'f4') for attribute in construct_list_of_attributes(save_mode)]
-
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        '''
-        scale.shape    = (N, 2) or (N, 3)
-        rotation.shape = (N, 4)
-        f_dc.shape     = (N, 3)
-        f_rest.shape   = (N, 45)
-        '''
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
-        elements[:] = list(map(tuple, attributes))
+
+        print(f"Saving {xyz.shape[0]} gaussians to ply: idx={idx}_{save_mode}.ply")
+
+        for axis_id, axis_name in enumerate(('x', 'y', 'z')):
+            elements[axis_name] = xyz[:, axis_id]
+        for axis_name in ('nx', 'ny', 'nz'):
+            elements[axis_name] = 0.0
+        for channel_id in range(3):
+            elements[f'f_dc_{channel_id}'] = f_dc[:, channel_id]
+        for coeff_id in range(45):
+            elements[f'f_rest_{coeff_id}'] = 0.0
+        elements['opacity'] = opacities[:, 0] if opacities.ndim > 1 else opacities
+        for scale_id in range(scale.shape[1]):
+            elements[f'scale_{scale_id}'] = scale[:, scale_id]
+        if save_mode == '3dgs' or save_mode == 'sky':
+            elements['scale_2'] = -10.0
+        for rot_id in range(rotation.shape[1]):
+            elements[f'rot_{rot_id}'] = rotation[:, rot_id]
+
         el = PlyElement.describe(elements, 'vertex')
-        save_path = os.path.join(gaussian_model.cfg['output']['save_dir'], 'ply', f'idx={idx}_{save_mode}.ply')
+        basename = filename if filename is not None else f'idx={idx}_{save_mode}.ply'
+        save_path = os.path.join(gaussian_model.cfg['output']['save_dir'], 'ply', basename)
         PlyData([el]).write(save_path)
         # Save Intrinsic.
         intrinsic_dict = {'fu': gaussian_model.tfer.fu, 'fv': gaussian_model.tfer.fv, 
@@ -251,9 +381,13 @@ def save_ply(gaussian_model, idx, save_mode='3dgs'):
             yaml.dump(intrinsic_dict, file, allow_unicode=True, sort_keys=False)
     
     elif save_mode == 'pth':
-        save_path = os.path.join(gaussian_model.cfg['output']['save_dir'], 'ply', f'idx={idx}_{save_mode}.pth')
+        basename = filename if filename is not None else f'idx={idx}_{save_mode}.pth'
+        save_path = os.path.join(gaussian_model.cfg['output']['save_dir'], 'ply', basename)
         xyz = gaussian_model._xyz.detach().cpu()
         globalkf_id = gaussian_model._globalkf_id.detach().cpu()
+        if storage_manager is not None and storage_manager._xyz.shape[0] > 0:
+            xyz = torch.cat((xyz, storage_manager._xyz.detach().cpu()), dim=0)
+            globalkf_id = torch.cat((globalkf_id, storage_manager._globalkf_id.detach().cpu()), dim=0)
         save_dict = {'xyz': xyz, 'globalkf_id': globalkf_id}
         torch.save(save_dict, save_path)
     else:

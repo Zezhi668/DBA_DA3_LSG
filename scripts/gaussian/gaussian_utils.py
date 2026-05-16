@@ -29,21 +29,41 @@ def get_pointcloud_v1(tfer, c2w, gt_rgb: torch.Tensor, gt_depth: torch.Tensor, p
     # STEP 1 Choose which pixel should we add;
     H, W = gt_rgb.shape[-2], gt_rgb.shape[-1]
     rgb = gt_rgb.unsqueeze(0)
-    all_valid_num = (gt_depth>0).sum()
+    valid_depth = torch.isfinite(gt_depth) & (gt_depth > 0)
+    all_valid_num = int(valid_depth.sum().item())
+    if all_valid_num == 0:
+        return (
+            torch.empty((0, 3), dtype=gt_depth.dtype, device=gt_depth.device),
+            torch.empty((0, 3), dtype=gt_rgb.dtype, device=gt_rgb.device),
+            torch.empty((0, 4), dtype=torch.float32, device=gt_depth.device),
+        )
     
-    gt_depth_cp = gt_depth.squeeze(0) + 0.0
+    gt_depth_cp = torch.where(valid_depth, gt_depth, torch.zeros_like(gt_depth)).squeeze(0)
     gt_depth_cp[pred_accum.squeeze(0)>tfer.cfg['adc_args']['accum_thresh']] = 0
-    accum_valid_num = (gt_depth_cp>0).sum()
-    N_samples = int(accum_valid_num/all_valid_num * N_points)
+    candidate_mask = gt_depth_cp > 0
+    accum_valid_num = int(candidate_mask.sum().item())
+    if accum_valid_num == 0:
+        return (
+            torch.empty((0, 3), dtype=gt_depth.dtype, device=gt_depth.device),
+            torch.empty((0, 3), dtype=gt_rgb.dtype, device=gt_rgb.device),
+            torch.empty((0, 4), dtype=torch.float32, device=gt_depth.device),
+        )
+    N_samples = int(accum_valid_num / max(all_valid_num, 1) * N_points)
 
-    pc_all = tfer.transform(gt_depth.squeeze(0), 'depth', 'world', pose=c2w) # (N, 3)
+    pc_all = tfer.transform(gt_depth_cp, 'depth', 'world', pose=c2w) # (N, 3)
     N_samples = min(N_samples, pc_all.shape[0])
+    if N_samples <= 0:
+        return (
+            torch.empty((0, 3), dtype=gt_depth.dtype, device=gt_depth.device),
+            torch.empty((0, 3), dtype=gt_rgb.dtype, device=gt_rgb.device),
+            torch.empty((0, 4), dtype=torch.float32, device=gt_depth.device),
+        )
     
     sampled_indices = torch.randperm(pc_all.shape[0], device=pc_all.device)[:N_samples]
     xyz = pc_all[sampled_indices] # (n, 3)
     
     # STEP 2 Get their relative rgb, q;
-    rgb = gt_rgb.permute(1, 2, 0)[gt_depth.squeeze(0)>0][sampled_indices] # (N, 3)
+    rgb = gt_rgb.permute(1, 2, 0)[candidate_mask][sampled_indices] # (N, 3)
     
     q = torch.randn((N_samples, 4), device=gt_depth.device, dtype=torch.float32) # (n, 4)
 

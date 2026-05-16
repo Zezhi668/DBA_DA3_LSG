@@ -378,6 +378,11 @@ class LoopRectifier:
         gaussian_model._stable_mask = gaussian_model._stable_mask[~delete_mask]
         gaussian_model._globalkf_id = gaussian_model._globalkf_id[~delete_mask]
         gaussian_model._globalkf_max_scores = gaussian_model._globalkf_max_scores[~delete_mask]
+        if hasattr(gaussian_model, "_birth_globalkf_id"):
+            if gaussian_model._birth_globalkf_id.shape[0] == delete_mask.shape[0]:
+                gaussian_model._birth_globalkf_id = gaussian_model._birth_globalkf_id[~delete_mask]
+            else:
+                gaussian_model._birth_globalkf_id = gaussian_model._globalkf_id.detach().clone()
         
         gaussian_model.setup_optimizer()
         
@@ -555,5 +560,3 @@ class LoopRectifier:
     
     def retrain_gaussian_storage_control(self):
         pass
-    
-    

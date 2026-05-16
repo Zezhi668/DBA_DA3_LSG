@@ -2,6 +2,18 @@ import numpy as np
 import shutil
 import torch
 import os
+import sys
+
+
+SCRIPT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPT_ROOT)
+
+REPO_ROOT = os.path.dirname(SCRIPT_ROOT)
+GTSAM_PYTHON_ROOT = os.path.join(REPO_ROOT, "submodules", "gtsam", "build", "python")
+if os.path.isdir(GTSAM_PYTHON_ROOT) and GTSAM_PYTHON_ROOT not in sys.path:
+    sys.path.insert(0, GTSAM_PYTHON_ROOT)
+
 from frontend.dbaf import DBAFusion
 from gaussian.gaussian_model import GaussianModel
 from gaussian.vis_utils import save_ply
