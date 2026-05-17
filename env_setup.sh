@@ -77,6 +77,7 @@ if [[ "${BUILD_GTSAM}" == "1" && -d "${REPO_ROOT}/submodules/gtsam" ]]; then
     -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF \
     -DGTSAM_BUILD_TESTS=OFF \
     -DGTSAM_WITH_TBB=OFF \
+    -DCMAKE_INSTALL_PREFIX="${ENV_PREFIX}" \
     -DCMAKE_PREFIX_PATH="${ENV_PREFIX}" \
     -DBOOST_ROOT="${ENV_PREFIX}"
   cmake --build "${REPO_ROOT}/submodules/gtsam/build" --target install -j"$(nproc)"
