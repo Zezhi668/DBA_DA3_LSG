@@ -68,13 +68,17 @@ if [[ "${BUILD_DBAF}" == "1" && -f "${REPO_ROOT}/submodules/dbaf/setup.py" ]]; t
 fi
 
 if [[ "${BUILD_GTSAM}" == "1" && -d "${REPO_ROOT}/submodules/gtsam" ]]; then
+  "${CONDA_BIN}" install -y -n "${ENV_NAME}" -c conda-forge boost-cpp
   run_in_env python -m pip install cmake ninja pybind11
+  ENV_PREFIX="$("${CONDA_BIN}" run -n "${ENV_NAME}" python -c 'import sys; print(sys.prefix)')"
   cmake -S "${REPO_ROOT}/submodules/gtsam" -B "${REPO_ROOT}/submodules/gtsam/build" \
     -DGTSAM_BUILD_PYTHON=ON \
     -DGTSAM_PYTHON_VERSION="${PYTHON_VERSION}" \
     -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF \
     -DGTSAM_BUILD_TESTS=OFF \
-    -DGTSAM_WITH_TBB=OFF
+    -DGTSAM_WITH_TBB=OFF \
+    -DCMAKE_PREFIX_PATH="${ENV_PREFIX}" \
+    -DBOOST_ROOT="${ENV_PREFIX}"
   cmake --build "${REPO_ROOT}/submodules/gtsam/build" --target install -j"$(nproc)"
 fi
 
