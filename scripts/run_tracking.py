@@ -33,7 +33,6 @@ from vings_utils.memory_monitor import MemoryMonitor
 import open3d as o3d
 from lietorch import SE3
 from gaussian.vis_utils import check_pcd_with_poses
-from metric.metric_model import Metric_Model
 if config['mode'] == 'vo_mast3rslam': from frontend_mast3r.mast3r_slam import Mast3rSLAM
 
 class Runner:
@@ -47,6 +46,7 @@ class Runner:
         else:
             self.tracker = DBAFusion(cfg)
         if 'use_metric' in cfg.keys() and cfg['use_metric'] and self.cfg['mode'] != 'vo_mast3rslam':
+            from metric.metric_model import Metric_Model
             self.metric_predictor = Metric_Model(cfg)
         self.memory_monitor.record(-1, tag="post_init", force=True)
             

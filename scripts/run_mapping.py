@@ -31,7 +31,6 @@ from vings_utils.middleware_utils import judge_and_package, retrieve_to_tracker,
 from vings_utils.memory_monitor import MemoryMonitor
 from storage.storage_manage import StorageManager
 from loop.loop_model import LoopModel
-from metric.metric_model import Metric_Model
 import time
 if config['mode'] == 'vo_nerfslam': from frontend_vo.vio_slam import VioSLAM
 from tqdm import tqdm

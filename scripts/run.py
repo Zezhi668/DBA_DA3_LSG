@@ -58,7 +58,6 @@ from vings_utils.memory_monitor import MemoryMonitor
 from storage.storage_manage import StorageManager
 from submap.submap_manager import SubmapManager
 from loop.loop_model import LoopModel
-from metric.metric_model import Metric_Model
 import time
 from tqdm import tqdm
 if config['mode'] == 'vo_nerfslam': from frontend_vo.vio_slam import VioSLAM
@@ -86,6 +85,7 @@ class Runner:
         self.looper = None
         
         if 'use_metric' in cfg.keys() and cfg['use_metric'] and self.cfg['mode'] != 'vo_mast3rslam':
+            from metric.metric_model import Metric_Model
             self.metric_predictor = Metric_Model(cfg) 
         
         if 'use_storage_manager' in cfg.keys() and cfg['use_storage_manager']:
