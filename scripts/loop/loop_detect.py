@@ -5,6 +5,8 @@ import numpy as np
 import cv2
 import time
 import kornia
+import os
+from pathlib import Path
 # from LightGlue.lightglue import LightGlue, SuperPoint, match_pair
 # from LightGlue.lightglue.utils import load_image
 # import sys
@@ -14,13 +16,38 @@ from gaussian.loss_utils import ssim_loss
 from vings_utils.sim3_utils import ransac_umeyama
 
 
+def _resolve_lightglue_weight_dir(weight_dir):
+    configured = Path(weight_dir).expanduser()
+    candidates = [configured]
+
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates.append(repo_root / "ckpts" / "lightglue")
+
+    env_root = os.environ.get("DBA_DA3_LSG_ROOT") or os.environ.get("DPT_LSG_ROOT")
+    if env_root:
+        candidates.append(Path(env_root).expanduser() / "ckpts" / "lightglue")
+
+    for candidate in candidates:
+        superpoint = candidate / "superpoint.onnx"
+        lightglue = candidate / "superpoint_lightglue.onnx"
+        if superpoint.is_file() and lightglue.is_file():
+            return candidate
+
+    checked = "\n".join(str(path) for path in candidates)
+    raise FileNotFoundError(
+        "LightGlue ONNX weights were not found. Expected both "
+        "`superpoint.onnx` and `superpoint_lightglue.onnx`. Checked:\n"
+        f"{checked}"
+    )
+
+
 class LoopDetector:
     def __init__(self, cfg):
         # -  -  -  -  -  -  -  -  -  -  -  -  -  -
         self.cfg = cfg
         ONNX_W = 512
         H, W = cfg['frontend']['image_size'][0], cfg['frontend']['image_size'][1]
-        WEIGHT_DIR = cfg['looper']['lightglue_weight_dir'] # '/data/wuke/workspace/LightGlue-ONNX/weights/'
+        WEIGHT_DIR = _resolve_lightglue_weight_dir(cfg['looper']['lightglue_weight_dir'])
         # -  -  -  -  -  -  -  -  -  -  -  -  -  -
 
         # Light glue declarations:
@@ -31,8 +58,8 @@ class LoopDetector:
         providers = ["CUDAExecutionProvider"]
         # providers = [("TensorrtExecutionProvider", {"trt_fp16_enable": True, "trt_engine_cache_enable": True, "trt_engine_cache_path": "weights/cache"})]
         self.matcher = LightGlueRunner(
-            extractor_path=f"{WEIGHT_DIR}/superpoint.onnx",
-            lightglue_path=f"{WEIGHT_DIR}/superpoint_lightglue.onnx",
+            extractor_path=str(WEIGHT_DIR / "superpoint.onnx"),
+            lightglue_path=str(WEIGHT_DIR / "superpoint_lightglue.onnx"),
             providers=providers,
             # TensorrtExecutionProvider, OpenVINOExecutionProvider
         )
